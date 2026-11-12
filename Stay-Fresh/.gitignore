@@ -3,3 +3,16 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Local credentials: never commit
+include/secrets.h
+
+# Dashboard
+dashboard/node_modules
+dashboard/dist
+dashboard/.env.local
+dashboard/.env.*.local
+dashboard/coverage
+
+# Host-side test binaries
+tools/native_tests/build
