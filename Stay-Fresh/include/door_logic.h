@@ -89,286 +89,48 @@ inline const char* toString(CalState s) {
   }
 }
 
-// ---------------------- Stillness window --------------------------
-// Rolling window of the most recent gyro samples. "Still enough" is judged
-// from the VARIABILITY (std dev) of the window, never from "every reading is
-// zero": a stationary gyro has a non-zero bias, and a hand adds tremor.
-class StillnessWindow {
+// ------------------- Gyro bias (simple average) --------------------
+// Original, simple behaviour: average BIAS_SAMPLES gyro readings (about
+// 2 s at 50 Hz) taken while the door is closed. Perfect stillness is NOT
+// required and the step never restarts itself. Because the estimate is a
+// plain average, a bump or tremor adds a small error: that is the price of
+// the easy workflow (drift is NOT fixed by this; see README).
+class BiasAverager {
  public:
-  StillnessWindow() { reset(); }
-  void reset() { idx_ = 0; count_ = 0; }
-  void push(const Vec3& v) {
-    buf_[idx_] = v;
-    idx_ = (idx_ + 1) % cfg::STILL_WINDOW_N;
-    if (count_ < cfg::STILL_WINDOW_N) count_++;
-  }
-  int count() const { return count_; }
-
-  // Mean and per-axis std dev of the most recent n samples. False if fewer
-  // than n samples have been collected.
-  bool stats(int n, Vec3& mean, Vec3& sd) const {
-    if (n <= 0 || n > count_) return false;
-    double s[3] = {0, 0, 0};
-    for (int k = 0; k < n; k++) {
-      const Vec3& v = at(k);
-      s[0] += v.x; s[1] += v.y; s[2] += v.z;
-    }
-    const double m[3] = {s[0] / n, s[1] / n, s[2] / n};
-    double q[3] = {0, 0, 0};
-    for (int k = 0; k < n; k++) {
-      const Vec3& v = at(k);
-      q[0] += (v.x - m[0]) * (v.x - m[0]);
-      q[1] += (v.y - m[1]) * (v.y - m[1]);
-      q[2] += (v.z - m[2]) * (v.z - m[2]);
-    }
-    mean = Vec3((float)m[0], (float)m[1], (float)m[2]);
-    sd = Vec3((float)sqrt(q[0] / n), (float)sqrt(q[1] / n), (float)sqrt(q[2] / n));
-    return true;
-  }
-
- private:
-  const Vec3& at(int k) const {  // k = 0 is the newest sample
-    int i = idx_ - 1 - k;
-    if (i < 0) i += cfg::STILL_WINDOW_N;
-    return buf_[i];
-  }
-  Vec3 buf_[cfg::STILL_WINDOW_N];
-  int idx_, count_;
-};
-
-// Trimmed mean: sort, drop `frac` of the values from each end, average the
-// rest. A few leftover spikes (a bump that slipped under the variability
-// limit) then cannot drag the offset estimate. Sorts `a` in place.
-inline float trimmedMean(float* a, int n, float frac) {
-  for (int i = 1; i < n; i++) {
-    float key = a[i];
-    int j = i - 1;
-    while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; j--; }
-    a[j + 1] = key;
-  }
-  int t = (int)(n * frac);
-  if (n - 2 * t < 1) t = 0;
-  double sum = 0;
-  for (int i = t; i < n - t; i++) sum += a[i];
-  return (float)(sum / (n - 2 * t));
-}
-
-// ---------------------- Initial gyro bias -------------------------
-// Collects steady samples into a pool until it holds BIAS_REQUIRED_ACCEPTED_MS
-// of them, then returns their trimmed mean.
-//   * Disturbance (window std too high, or window mean far from the pool):
-//     collection PAUSES; samples already accepted are KEPT; collection resumes
-//     when the window settles.
-//   * The pool is discarded only if the offset itself has moved (window mean
-//     differs from the pool by > STILL_MAX_SHIFT_DPS for SHIFT_RESTART_S),
-//     e.g. the sensor was still warming up.
-//   * If BIAS_MAX_WAIT_MS passes first, it reports TimedOut with the reason.
-// LIMITATION (physics, not tunable away): a gyro turning at a perfectly
-// CONSTANT slow rate looks exactly like a gyro with a constant bias. Rotation
-// that starts and stops is caught (it pauses and the pool is kept), and a
-// slow turn below STILL_MAX_SHIFT_DPS can be absorbed. Rotation that is
-// constant from the very first sample cannot be detected here; the
-// open/close consistency check during calibration is the backstop.
-class BiasMeasurement {
- public:
-  enum class Status : uint8_t { Collecting, Paused, Done, TimedOut };
-
-  explicit BiasMeasurement(float warmupS = cfg::WARMUP_MS / 1000.0f,
-                           float requiredS = cfg::BIAS_REQUIRED_ACCEPTED_MS / 1000.0f,
-                           float maxWaitS = cfg::BIAS_MAX_WAIT_MS / 1000.0f)
-      : warmupS_(warmupS), requiredS_(requiredS), maxWaitS_(maxWaitS) {
-    restart();
-  }
-
-  void restart() {
-    elapsed_ = accepted_ = shiftS_ = 0;
-    poolN_ = 0;
-    for (int i = 0; i < 3; i++) poolSum_[i] = 0;
-    pauses_ = restarts_ = dropped_ = 0;
-    bigMean_ = noisy_ = 0;
-    lastMeanMag_ = 0;
-    bestStd_ = 1e9f;
-    paused_ = false;
+  BiasAverager() { reset(); }
+  void reset() {
+    n_ = 0;
+    for (int i = 0; i < 3; i++) { sum_[i] = 0; min_[i] = 1e9f; max_[i] = -1e9f; }
     bias_ = Vec3();
-    reason_[0] = 0;
-    status_ = Status::Collecting;
-    win_.reset();
   }
-
-  Status add(const Vec3& g, float dt) {
-    if (status_ == Status::Done || status_ == Status::TimedOut) return status_;
-    elapsed_ += dt;
-    if (dt > cfg::GAP_MAX_INTEGRATE_DT_S) win_.reset();  // data no longer contiguous
-    win_.push(g);
-
-    if (elapsed_ >= warmupS_) {
-      Vec3 mean, sd;
-      if (win_.stats(cfg::STILL_WINDOW_N, mean, sd)) {
-        float spread = maxAbsAxis(sd);
-        if (spread < bestStd_) bestStd_ = spread;
-        float meanMag = magnitude(mean);
-        bool steady = spread <= cfg::STILL_MAX_STD_DPS && meanMag <= cfg::BIAS_MAX_ABS_DPS;
-        if (meanMag > cfg::BIAS_MAX_ABS_DPS) { bigMean_++; lastMeanMag_ = meanMag; }
-        else if (spread > cfg::STILL_MAX_STD_DPS) noisy_++;
-        if (!steady) {
-          shiftS_ = 0;
-        } else if (poolN_ >= cfg::STILL_WINDOW_N / 2) {
-          Vec3 poolMean((float)(poolSum_[0] / poolN_), (float)(poolSum_[1] / poolN_), (float)(poolSum_[2] / poolN_));
-          if (magnitude(mean - poolMean) > cfg::STILL_MAX_SHIFT_DPS) {
-            steady = false;  // sustained-movement check: pause, keep the pool
-            shiftS_ += dt;
-            if (shiftS_ >= cfg::SHIFT_RESTART_S) {  // it never went back: the offset really changed
-              poolN_ = 0;
-              for (int i = 0; i < 3; i++) poolSum_[i] = 0;
-              accepted_ = 0;
-              restarts_++;
-              shiftS_ = 0;
-            }
-          } else {
-            shiftS_ = 0;
-          }
-        }
-        if (steady) {
-          poolPush(g);
-          accepted_ += dt;
-          paused_ = false;
-        } else if (!paused_) {
-          paused_ = true;
-          pauses_++;
-        }
-      }
+  // Returns true when the BIAS_SAMPLES-th sample has been added.
+  bool add(const Vec3& g) {
+    if (n_ >= cfg::BIAS_SAMPLES) return true;
+    const float v[3] = {g.x, g.y, g.z};
+    for (int i = 0; i < 3; i++) {
+      sum_[i] += v[i];
+      if (v[i] < min_[i]) min_[i] = v[i];
+      if (v[i] > max_[i]) max_[i] = v[i];
     }
-
-    if (accepted_ >= requiredS_) finalize();
-    if ((status_ == Status::Collecting) && elapsed_ >= maxWaitS_) {
-      explainTimeout();
-      status_ = Status::TimedOut;
-    }
-    if (status_ == Status::Collecting && paused_) return Status::Paused;
-    return status_;
-  }
-
-  const Vec3& bias() const { return bias_; }
-  const char* reason() const { return reason_; }
-  bool inWarmup() const { return elapsed_ < warmupS_; }
-  int percent() const {
-    int p = (int)(100.0f * accepted_ / requiredS_);
-    return p > 100 ? 100 : p;
-  }
-  float acceptedS() const { return accepted_; }
-  uint32_t pauses() const { return pauses_; }
-  uint32_t restarts() const { return restarts_; }
-  int samples() const { return poolN_; }
-  float calmestWindowDps() const { return bestStd_; }
-
- private:
-  void poolPush(const Vec3& g) {
-    if (poolN_ >= cfg::POOL_MAX) dropOldestHalf();
-    pool_[poolN_++] = g;
-    poolSum_[0] += g.x; poolSum_[1] += g.y; poolSum_[2] += g.z;
-  }
-  void dropOldestHalf() {
-    int half = poolN_ / 2;
-    for (int i = half; i < poolN_; i++) pool_[i - half] = pool_[i];
-    poolN_ -= half;
-    accepted_ *= (float)poolN_ / (float)(poolN_ + half);
-    poolSum_[0] = poolSum_[1] = poolSum_[2] = 0;
-    for (int i = 0; i < poolN_; i++) {
-      poolSum_[0] += pool_[i].x; poolSum_[1] += pool_[i].y; poolSum_[2] += pool_[i].z;
-    }
-  }
-  Vec3 trimmedOf(int from, int to) const {  // pool_[from, to)
-    float a[cfg::POOL_MAX];
-    float out[3];
-    for (int axis = 0; axis < 3; axis++) {
-      int n = 0;
-      for (int i = from; i < to; i++) a[n++] = axis == 0 ? pool_[i].x : axis == 1 ? pool_[i].y : pool_[i].z;
-      out[axis] = trimmedMean(a, n, cfg::BIAS_TRIM_FRACTION);
-    }
-    return Vec3(out[0], out[1], out[2]);
-  }
-  void finalize() {
-    Vec3 first = trimmedOf(0, poolN_ / 2);
-    Vec3 second = trimmedOf(poolN_ / 2, poolN_);
-    float diff = magnitude(first - second);
-    if (diff > cfg::BIAS_MAX_HALF_DIFF_DPS) {
-      // Offset was still moving: forget the older half and keep collecting.
-      dropOldestHalf();
-      dropped_++;
-      return;
-    }
-    bias_ = trimmedOf(0, poolN_);
-    if (magnitude(bias_) > cfg::BIAS_MAX_ABS_DPS) {
-      snprintf(reason_, sizeof(reason_), "offset %.1f dps is implausibly large: sensor fault?", magnitude(bias_));
-      status_ = Status::TimedOut;
-      return;
-    }
-    status_ = Status::Done;
-  }
-  void explainTimeout() {
-    if (accepted_ < 0.5f * requiredS_ && bigMean_ > noisy_) {
-      snprintf(reason_, sizeof(reason_),
-               "the sensor was turning at a steady %.1f dps on average, far above any plausible gyro offset (limit %.1f). "
-               "Is the door or sensor moving? Keep the door closed and still.",
-               lastMeanMag_, cfg::BIAS_MAX_ABS_DPS);
-    } else if (accepted_ < 0.5f * requiredS_) {
-      snprintf(reason_, sizeof(reason_),
-               "only %.1f of %.1f s were steady enough (%u pauses). The calmest 1 s window still varied by %.2f dps "
-               "(limit %.2f). Too much movement or vibration; rest your hands on something solid, or raise STILL_MAX_STD_DPS.",
-               accepted_, requiredS_, (unsigned)pauses_, bestStd_, cfg::STILL_MAX_STD_DPS);
-    } else if (restarts_ > 0 || dropped_ > 0) {
-      snprintf(reason_, sizeof(reason_),
-               "the offset kept changing (%u restarts): the sensor may still be warming up, or slowly turning.",
-               (unsigned)(restarts_ + dropped_));
-    } else {
-      snprintf(reason_, sizeof(reason_),
-               "collected %.1f of %.1f s but kept pausing (%u pauses). Hold the door and sensor steadier.",
-               accepted_, requiredS_, (unsigned)pauses_);
-    }
-  }
-
-  float warmupS_, requiredS_, maxWaitS_;
-  float elapsed_, accepted_, shiftS_, bestStd_, lastMeanMag_;
-  uint32_t pauses_, restarts_, dropped_, bigMean_, noisy_;
-  int poolN_;
-  double poolSum_[3];
-  Vec3 pool_[cfg::POOL_MAX];
-  StillnessWindow win_;
-  bool paused_;
-  Vec3 bias_;
-  char reason_[256];
-  Status status_;
-};
-
-// ----------------------- Settle gate -------------------------------
-// After a button press the housing is bumped. Wait at least minMs, then
-// confirm as soon as the sensor looks steady; give up after timeoutMs.
-// The caller keeps integrating rotation the whole time, so any real motion
-// during the settling period is included, not lost.
-class SettleGate {
- public:
-  enum class Result : uint8_t { Idle, Pending, Confirmed, TimedOut };
-  SettleGate(uint32_t minMs, uint32_t timeoutMs) : minMs_(minMs), timeoutMs_(timeoutMs), active_(false), start_(0) {}
-  bool begin(uint32_t nowMs) {  // false if already settling
-    if (active_) return false;
-    active_ = true;
-    start_ = nowMs;
+    n_++;
+    if (n_ < cfg::BIAS_SAMPLES) return false;
+    bias_ = Vec3((float)(sum_[0] / n_), (float)(sum_[1] / n_), (float)(sum_[2] / n_));
     return true;
   }
-  void cancel() { active_ = false; }
-  bool active() const { return active_; }
-  Result service(uint32_t nowMs, bool settled) {
-    if (!active_) return Result::Idle;
-    uint32_t el = nowMs - start_;
-    if (el >= minMs_ && settled) { active_ = false; return Result::Confirmed; }
-    if (el >= timeoutMs_) { active_ = false; return Result::TimedOut; }
-    return Result::Pending;
+  const Vec3& bias() const { return bias_; }
+  int count() const { return n_; }
+  // Information only (never blocks): the sensor clearly moved while averaging.
+  bool noisy() const {
+    for (int i = 0; i < 3; i++)
+      if (n_ > 0 && max_[i] - min_[i] > cfg::BIAS_NOISY_RANGE_DPS) return true;
+    return false;
   }
 
  private:
-  uint32_t minMs_, timeoutMs_;
-  bool active_;
-  uint32_t start_;
+  int n_;
+  double sum_[3];
+  float min_[3], max_[3];
+  Vec3 bias_;
 };
 
 // ------------------------ Calibration checks ----------------------
@@ -380,163 +142,83 @@ struct CalibrationResult {
   CalibrationResult() : ok(false), axis(), openAngleDeg(0) { message[0] = 0; }
 };
 
-inline float allowedMismatch(float absDeg, float rel, float reference) {
-  float r = rel * reference;
-  return r > absDeg ? r : absDeg;
-}
-
-// One open+close round. 'open' and 'close' are the integrated rotation
-// vectors (deg, sensor frame) for the two movements.
-inline CalibrationResult validateRound(const Vec3& open, const Vec3& close, int round) {
-  CalibrationResult r;
-  float mo = magnitude(open), mc = magnitude(close);
-  if (mo < cfg::CAL_MIN_MOVE_DEG || mc < cfg::CAL_MIN_MOVE_DEG) {
-    snprintf(r.message, sizeof(r.message),
-             "Round %d: the door only turned %.0f deg opening / %.0f deg closing (need at least %.0f). "
-             "Open it to your normal position and make sure the sensor is firmly attached.",
-             round, mo, mc, cfg::CAL_MIN_MOVE_DEG);
-    return r;
-  }
-  Vec3 axis = normalized(open - close);
-  float po = dot(open, axis), pc = -dot(close, axis);
-  if (po / mo < cfg::CAL_MIN_ALIGNMENT || pc / mc < cfg::CAL_MIN_ALIGNMENT) {
-    snprintf(r.message, sizeof(r.message),
-             "Round %d: opening and closing were not the same rotation in opposite directions "
-             "(alignment %.2f / %.2f, need %.2f). The sensor may be loose, or the door was lifted or twisted.",
-             round, po / mo, pc / mc, cfg::CAL_MIN_ALIGNMENT);
-    return r;
-  }
-  float mismatch = fabsf(po - pc);
-  float allowed = allowedMismatch(cfg::CAL_MAX_CLOSURE_ABS_DEG, cfg::CAL_MAX_CLOSURE_REL, 0.5f * (po + pc));
-  if (mismatch > allowed) {
-    snprintf(r.message, sizeof(r.message),
-             "Round %d: measured %.1f deg opening but %.1f deg closing (mismatch %.1f deg, limit %.1f). "
-             "The gyro drifted, the door was not fully closed, or it moved when you pressed the button.",
-             round, po, pc, mismatch, allowed);
-    return r;
-  }
-  r.ok = true;
-  r.axis = axis;
-  r.openAngleDeg = 0.5f * (po + pc);
-  snprintf(r.message, sizeof(r.message), "Round %d OK: open %.1f deg, close %.1f deg.", round, po, pc);
-  return r;
-}
-
-// All four movements: open, close, open, close.
+// The four button-confirmed movements: open, close, open, close
+// (integrated rotation vectors, degrees, sensor frame).
+// Basic checks only: negligible movement, inconsistent direction, and the
+// original "no movement more than 40 % from the average" check.
 inline CalibrationResult validateCalibration(const Vec3 moves[4]) {
-  CalibrationResult r1 = validateRound(moves[0], moves[1], 1);
-  if (!r1.ok) return r1;
-  CalibrationResult r2 = validateRound(moves[2], moves[3], 2);
-  if (!r2.ok) return r2;
-
   CalibrationResult r;
-  float axisAgreement = dot(r1.axis, r2.axis);
-  if (axisAgreement < 0.95f) {
+  // Opening and closing are opposite rotations about the same hinge axis.
+  Vec3 direction = (moves[0] - moves[1]) + (moves[2] - moves[3]);
+  float length = magnitude(direction);
+  if (length < 1.0f) {
     snprintf(r.message, sizeof(r.message),
-             "The two rounds rotated about different axes (agreement %.2f, need 0.95). "
-             "Use the same open position and keep the sensor fixed to the door.",
-             axisAgreement);
+             "the four movements cancel out or are negligible: open and close must be opposite turns of the door.");
     return r;
   }
-  Vec3 axis = normalized((moves[0] - moves[1]) + (moves[2] - moves[3]));
-  float p[4] = {dot(moves[0], axis), -dot(moves[1], axis), dot(moves[2], axis), -dot(moves[3], axis)};
-  float mean = 0.25f * (p[0] + p[1] + p[2] + p[3]);
-  float openDiff = fabsf(p[0] - p[2]);
-  float allowed = allowedMismatch(cfg::CAL_MAX_REPEAT_ABS_DEG, cfg::CAL_MAX_REPEAT_REL, mean);
-  if (openDiff > allowed) {
-    snprintf(r.message, sizeof(r.message),
-             "Round 1 opened %.1f deg but round 2 opened %.1f deg (difference %.1f, limit %.1f). "
-             "Open to the same position each time.",
-             p[0], p[2], openDiff, allowed);
-    return r;
+  Vec3 axis = direction * (1.0f / length);
+  const float p[4] = {dot(moves[0], axis), -dot(moves[1], axis), dot(moves[2], axis), -dot(moves[3], axis)};
+  for (int i = 0; i < 4; i++) {
+    float mag = magnitude(moves[i]);
+    const char* what = (i % 2 == 0) ? "opening" : "closing";
+    if (mag < cfg::CAL_MIN_MOVE_DEG) {
+      snprintf(r.message, sizeof(r.message),
+               "the %s movement %d was only %.0f deg (need at least %.0f): the door barely moved.", what, i + 1, mag,
+               cfg::CAL_MIN_MOVE_DEG);
+      return r;
+    }
+    if (p[i] < cfg::CAL_MIN_MOVE_DEG || p[i] / mag < cfg::CAL_MIN_ALIGNMENT) {
+      snprintf(r.message, sizeof(r.message),
+               "the %s movement %d turned the wrong way or about a different axis than the others.", what, i + 1);
+      return r;
+    }
+  }
+  float average = 0.25f * (p[0] + p[1] + p[2] + p[3]);
+  for (int i = 0; i < 4; i++) {
+    if (fabsf(p[i] - average) > average * cfg::CAL_MAX_DEVIATION) {
+      snprintf(r.message, sizeof(r.message),
+               "movement sizes differ too much (%.0f, %.0f, %.0f, %.0f deg). Use the same open position each time.",
+               p[0], p[1], p[2], p[3]);
+      return r;
+    }
   }
   r.ok = true;
   r.axis = axis;
-  r.openAngleDeg = mean;
-  snprintf(r.message, sizeof(r.message), "Calibration OK: typical opening %.1f deg.", mean);
+  r.openAngleDeg = average;
+  snprintf(r.message, sizeof(r.message), "Normal open angle: %.1f degrees.", average);
   return r;
 }
 
-// Collects the four button-confirmed movements, validating each round as
-// soon as it completes so the user gets a precise retry prompt.
-//
-// A button press only STARTS a capture. The position is saved once the
-// sensor has settled (see SettleGate); the rotation integrated meanwhile is
-// part of the saved movement.
+// Collects the four movements. Each Button 1 press is accepted immediately.
 class CalibrationSession {
  public:
-  enum class Outcome : uint8_t { Pending, SettleTimeout, Saved, RoundFailed, Failed, Complete, RestartAccepted };
+  enum class Outcome : uint8_t { Saved, Complete, Failed };
 
-  CalibrationSession() : gate_(cfg::SETTLE_MS, cfg::SETTLE_TIMEOUT_MS), rotAtPress_(), settleMotion_(0) { begin(); }
+  CalibrationSession() { begin(); }
   void begin() {
     stage_ = 0;
-    awaitRestart_ = false;
     result_ = CalibrationResult();
-    gate_.cancel();
   }
   int round() const { return stage_ / 2 + 1; }
   bool expectingOpen() const { return stage_ % 2 == 0; }
-  bool awaitingRestart() const { return awaitRestart_; }
-  bool capturing() const { return gate_.active(); }
   const CalibrationResult& result() const { return result_; }
-  float settleMotionDeg() const { return settleMotion_; }  // rotation during the last settle period
 
-  bool requestCapture(uint32_t nowMs, const Vec3& rotationNow) {
-    if (!gate_.begin(nowMs)) return false;
-    rotAtPress_ = rotationNow;
-    return true;
-  }
-
-  // Call regularly while capturing(). 'rotation' = rotation integrated since
-  // the last accepted capture. The caller must reset its accumulator for every
-  // outcome except Pending and SettleTimeout.
-  Outcome service(uint32_t nowMs, bool settled, const Vec3& rotation) {
-    switch (gate_.service(nowMs, settled)) {
-      case SettleGate::Result::Confirmed:
-        settleMotion_ = magnitude(rotation - rotAtPress_);
-        return accept(rotation);
-      case SettleGate::Result::TimedOut: return Outcome::SettleTimeout;
-      default: return Outcome::Pending;
-    }
-  }
-
-  // Record one confirmed position (also usable directly in tests).
-  Outcome accept(const Vec3& rotation) {
-    if (awaitRestart_) {
-      awaitRestart_ = false;
-      return Outcome::RestartAccepted;
-    }
+  // 'rotation' = rotation integrated since the previous press.
+  Outcome press(const Vec3& rotation) {
     moves_[stage_++] = rotation;
-    if (stage_ == 2 || stage_ == 4) {
-      int rnd = stage_ / 2;
-      CalibrationResult r = validateRound(moves_[2 * rnd - 2], moves_[2 * rnd - 1], rnd);
-      if (!r.ok) {
-        result_ = r;
-        stage_ = 2 * (rnd - 1);
-        awaitRestart_ = true;
-        return Outcome::RoundFailed;
-      }
+    if (stage_ < 4) return Outcome::Saved;
+    result_ = validateCalibration(moves_);
+    if (!result_.ok) {
+      stage_ = 0;  // as in the original: start the four presses again
+      return Outcome::Failed;
     }
-    if (stage_ == 4) {
-      result_ = validateCalibration(moves_);
-      if (!result_.ok) {
-        stage_ = 0;
-        awaitRestart_ = true;
-        return Outcome::Failed;
-      }
-      return Outcome::Complete;
-    }
-    return Outcome::Saved;
+    return Outcome::Complete;
   }
 
  private:
   Vec3 moves_[4];
   int stage_;
-  bool awaitRestart_;
   CalibrationResult result_;
-  SettleGate gate_;
-  Vec3 rotAtPress_;
-  float settleMotion_;
 };
 
 // ------------------------ Door-angle estimator --------------------
@@ -567,7 +249,6 @@ class DoorEstimator {
     sinceRef_ = 0;
     rotation_ = Vec3();
     hasFilt_ = false;
-    still_.reset();
     resetBlock();
   }
   void setBias(const Vec3& b) {
@@ -590,7 +271,6 @@ class DoorEstimator {
       // Too long to extrapolate. Do not invent motion; flag the angle.
       if (calibrated_) quality_ = AngleQuality::Degraded;
       hasFilt_ = false;
-      still_.reset();
       resetBlock();
       return r;
     }
@@ -598,14 +278,14 @@ class DoorEstimator {
     Vec3 corrected = raw - bias_;
     filt_ = hasFilt_ ? filt_ + (corrected - filt_) * cfg::RATE_EMA_ALPHA : corrected;
     hasFilt_ = true;
-    still_.push(corrected);  // unfiltered: judge real variability
 
     if (!calibrated_) {
       rotation_ = rotation_ + filt_ * dt;
     } else {
       angle_ += dot(filt_, axis_) * dt;
     }
-    adaptBias(raw, dt, r);
+    // Bias refinement only AFTER calibration, so calibration itself is plain integration.
+    if (calibrated_) adaptBias(raw, dt, r);
     if (calibrated_) updateState(r);
     return r;
   }
@@ -613,7 +293,6 @@ class DoorEstimator {
   void markSensorLost() {
     if (calibrated_) quality_ = AngleQuality::Degraded;
     hasFilt_ = false;
-    still_.reset();
     resetBlock();
   }
 
@@ -630,14 +309,6 @@ class DoorEstimator {
   void resetRotation() { rotation_ = Vec3(); }
 
   const Vec3& rotation() const { return rotation_; }
-  // Steady enough to confirm a position: the last CAPTURE_WINDOW_MS of
-  // bias-corrected samples have low variability AND a small mean rotation
-  // rate (so a slow continuing turn is not mistaken for "still").
-  bool settled() const {
-    Vec3 m, sd;
-    if (!still_.stats(cfg::CAPTURE_N, m, sd)) return false;
-    return maxAbsAxis(sd) <= cfg::STILL_MAX_STD_DPS && magnitude(m) <= cfg::CAPTURE_MAX_MEAN_DPS;
-  }
   bool calibrated() const { return calibrated_; }
   float angle() const { return angle_; }
   float openAngle() const { return openAngle_; }
@@ -706,8 +377,7 @@ class DoorEstimator {
         bias_ = candidate;
         // The block was integrated with the old bias; remove that
         // stationary-period error from the running angle / rotation.
-        if (calibrated_) angle_ -= dot(delta, axis_) * block_.t;
-        else rotation_ = rotation_ - delta * block_.t;
+        angle_ -= dot(delta, axis_) * block_.t;
         biasAdjustments_++;
         r.biasAdapted = true;
       }
@@ -740,7 +410,6 @@ class DoorEstimator {
   ClosureSource closure_;
   AngleQuality quality_;
   uint32_t missed_, biasAdjustments_, clamped_;
-  StillnessWindow still_;
   Block block_;
 };
 

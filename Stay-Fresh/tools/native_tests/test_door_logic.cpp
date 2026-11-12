@@ -62,304 +62,165 @@ static void hold(Sim& s, DoorEstimator& e, float seconds) { run(s, e, seconds, 0
 static Vec3 axisA() { return Vec3(0.3f, 0.2f, 0.93f); }
 
 // ------------------------------------------------------------------
-// Feed `seconds` of samples; stops early at a terminal status. Returns the last status.
-static BiasMeasurement::Status feedBias(Sim& s, BiasMeasurement& b, float& t, float seconds, float rate = 0,
-                                        Vec3 offset = Vec3(), float tremorAmp = 0) {
-  BiasMeasurement::Status st = BiasMeasurement::Status::Collecting;
-  int n = (int)(seconds / 0.02f + 0.5f);
-  for (int i = 0; i < n; i++) {
-    Vec3 g = s.sample(rate) + offset;
-    if (tremorAmp > 0) {  // ~8 Hz hand tremor, different phase per axis
-      g = g + Vec3(tremorAmp * sinf(6.2832f * 8 * t), tremorAmp * sinf(6.2832f * 8 * t + 2.0f), tremorAmp * sinf(6.2832f * 8 * t + 4.0f));
-    }
-    st = b.add(g, 0.02f);
-    t += 0.02f;
-    if (st == BiasMeasurement::Status::Done || st == BiasMeasurement::Status::TimedOut) break;
-  }
-  return st;
-}
-using BS = BiasMeasurement::Status;
-
-static void test_trimmed_mean() {
-  printf("trimmed mean\n");
-  float a[105];
-  for (int i = 0; i < 100; i++) a[i] = 1.0f + 0.001f * (i % 5);
-  for (int i = 100; i < 105; i++) a[i] = 100.0f;  // 5 outliers
-  float plain = 0;
-  for (int i = 0; i < 105; i++) plain += a[i];
-  plain /= 105;
-  float tm = trimmedMean(a, 105, 0.10f);
-  CHECK(plain > 5.0f && fabsf(tm - 1.002f) < 0.01f, "plain=%.2f trimmed=%.4f", plain, tm);
-  float one[1] = {3.5f};
-  CHECK(trimmedMean(one, 1, 0.10f) == 3.5f);
-}
-
-static void test_bias_measurement() {
-  printf("bias measurement (rolling window)\n");
+static void test_bias_average() {
+  printf("bias average (simple)\n");
   const Vec3 trueBias(1.2f, -0.7f, 0.4f);
-  {  // quiet sensor: ~3 s warm-up + 5 s accepted
+  {  // 100 samples, noisy: done at exactly sample 100
     Sim s(1, axisA(), trueBias, 0.08f);
-    BiasMeasurement b;
-    float t = 0;
-    BS st = feedBias(s, b, t, 20);
-    CHECK(st == BS::Done, "%s", b.reason());
+    BiasAverager b;
+    int n = 0;
+    bool done = false;
+    while (!done && n < 1000) { done = b.add(s.sample(0)); n++; }
+    CHECK(done && n == cfg::BIAS_SAMPLES, "n=%d", n);
     CHECK(magnitude(b.bias() - trueBias) < 0.05f, "err=%.3f", magnitude(b.bias() - trueBias));
-    CHECK(t > 7.9f && t < 9.0f, "took %.1f s", t);
-    CHECK(b.restarts() == 0 && b.pauses() == 0);
+    CHECK(!b.noisy());
   }
-  {  // hand tremor (0.85 dps rms per axis) is tolerated and averages out
+  {  // hand tremor and one bump: no stillness requirement, no restart, still finishes at 100 samples
     Sim s(2, axisA(), trueBias, 0.08f);
-    BiasMeasurement b;
-    float t = 0;
-    BS st = feedBias(s, b, t, 25, 0, Vec3(), 1.2f);
-    CHECK(st == BS::Done, "tremor must be tolerated: %s", b.reason());
-    CHECK(magnitude(b.bias() - trueBias) < 0.15f, "err=%.3f", magnitude(b.bias() - trueBias));
-  }
-  {  // brief bumps (button press): pause, keep accepted samples, resume. NO restart.
-    Sim s(3, axisA(), trueBias, 0.08f);
-    BiasMeasurement b;
-    float t = 0;
-    feedBias(s, b, t, 6.0f);                         // 3 s of accepted samples so far
-    CHECK(b.percent() > 40 && b.percent() < 80, "percent=%d", b.percent());
-    int before = b.samples();
-    BS st = feedBias(s, b, t, 0.1f, 25.0f);          // 100 ms bump at 25 dps
-    CHECK(st == BS::Paused || st == BS::Collecting);
-    st = feedBias(s, b, t, 0.2f);
-    CHECK(st == BS::Paused, "must pause while the bump is inside the window");
-    CHECK(b.samples() >= before, "accepted samples must be kept");
-    feedBias(s, b, t, 2.0f);
-    st = feedBias(s, b, t, 0.2f, 15.0f);             // a second, rougher bump
-    st = feedBias(s, b, t, 10.0f);
-    CHECK(st == BS::Done, "%s", b.reason());
-    CHECK(b.restarts() == 0 && b.pauses() >= 2, "restarts=%u pauses=%u", b.restarts(), b.pauses());
-    CHECK(t < 15.0f, "finished at %.1f s (a full restart would take far longer)", t);
-    CHECK(magnitude(b.bias() - trueBias) < 0.08f, "bump samples must not pollute: err=%.3f", magnitude(b.bias() - trueBias));
-  }
-  {  // deliberate rotation the whole time: must NOT be calibrated; times out with an explanation
-    Sim s(4, axisA(), trueBias, 0.08f);
-    BiasMeasurement b;
-    float t = 0;
-    BS st = feedBias(s, b, t, 40, 15.0f);
-    CHECK(st == BS::TimedOut, "rotation must be rejected");
-    CHECK(t > 29.0f && t < 31.0f, "gave up at %.1f s", t);
-    printf("  reason: %s\n", b.reason());
-    CHECK(strstr(b.reason(), "turning") != nullptr, "explains the cause");
-  }
-  {  // door swung back and forth (high variability): rejected, with the variability explanation
-    Sim s(41, axisA(), trueBias, 0.08f);
-    BiasMeasurement b;
-    float t = 0;
-    BS st = BS::Collecting;
-    for (int i = 0; i < 2000 && st != BS::TimedOut && st != BS::Done; i++) {
-      st = b.add(s.sample(20.0f * sinf(6.2832f * 0.5f * t)), 0.02f);
-      t += 0.02f;
+    BiasAverager b;
+    int n = 0;
+    bool done = false;
+    while (!done && n < 1000) {
+      float t = n * 0.02f;
+      Vec3 g = s.sample(0) + Vec3(1.5f * sinf(6.2832f * 8 * t), 1.5f * sinf(6.2832f * 8 * t + 2), 1.5f * sinf(6.2832f * 8 * t + 4));
+      if (n == 40) g = g + Vec3(30, 30, 30);  // bump
+      done = b.add(g);
+      n++;
     }
-    CHECK(st == BS::TimedOut);
-    printf("  reason: %s\n", b.reason());
-    CHECK(strstr(b.reason(), "steady enough") != nullptr);
-  }
-  {  // rotation that starts AND stops: pause, keep old samples, no pollution
-    Sim s(5, axisA(), trueBias, 0.08f);
-    BiasMeasurement b;
-    float t = 0;
-    feedBias(s, b, t, 6.0f);                          // 3 s accepted
-    feedBias(s, b, t, 5.0f, 3.0f);                    // slow 3 dps turn: steady-looking, but shifted
-    BS st = feedBias(s, b, t, 12.0f);                 // door at rest again
-    CHECK(st == BS::Done, "%s", b.reason());
-    CHECK(b.restarts() == 0, "restarts=%u", b.restarts());
-    CHECK(magnitude(b.bias() - trueBias) < 0.1f, "slow turn leaked into the offset: err=%.3f", magnitude(b.bias() - trueBias));
-  }
-  {  // the offset itself steps and stays (warming up): the pool restarts, new offset adopted
-    Sim s(6, axisA(), trueBias, 0.08f);
-    BiasMeasurement b;
-    float t = 0;
-    feedBias(s, b, t, 6.0f);
-    Vec3 step(1.0f, 0, 0);
-    BS st = feedBias(s, b, t, 23.0f, 0, step);
-    CHECK(st == BS::Done, "%s", b.reason());
-    CHECK(b.restarts() == 1, "restarts=%u", b.restarts());
-    CHECK(magnitude(b.bias() - (trueBias + step)) < 0.1f, "err=%.3f", magnitude(b.bias() - (trueBias + step)));
-  }
-  {  // HONEST LIMITATION: constant slow rotation from the first sample is indistinguishable from bias
-    Sim s(7, axisA(), trueBias, 0.08f);
-    BiasMeasurement b;
-    float t = 0;
-    BS st = feedBias(s, b, t, 20, 2.0f);
-    CHECK(st == BS::Done);
-    CHECK(fabsf(magnitude(b.bias() - trueBias) - 2.0f) < 0.2f, "documented limitation: constant 2 dps was taken as offset");
-  }
-  {  // sensor values missing (every 4th sample): not enough accepted time -> timeout, not silent acceptance
-    Sim s(8, axisA(), trueBias, 0.08f);
-    BiasMeasurement b;
-    BS st = BS::Collecting;
-    for (int i = 0; i < 2000 && st != BS::Done && st != BS::TimedOut; i++) {
-      Vec3 g = s.sample(0);
-      // each sample arrives 300 ms late: window never contiguous
-      st = b.add(g, 0.3f);
-    }
-    CHECK(st == BS::TimedOut, "non-contiguous data must not be accepted");
+    CHECK(done && n == cfg::BIAS_SAMPLES, "n=%d", n);
+    CHECK(b.noisy(), "informational flag only");
+    CHECK(magnitude(b.bias() - trueBias) < 1.0f, "err=%.3f (a plain average is only approximately right)", magnitude(b.bias() - trueBias));
   }
 }
 
 static void test_calibration_validation() {
-  printf("calibration validation\n");
+  printf("calibration validation (basic checks)\n");
   Vec3 ax = normalized(axisA());
-  // The exact numbers from the field log: 64.7 / 47.1 / 84.4 / 71.9
-  {
+  {  // the field log that the stricter checks rejected is accepted again (original behaviour)
     Vec3 m[4] = {ax * 64.7f, ax * -47.1f, ax * 84.4f, ax * -71.9f};
     CalibrationResult r = validateCalibration(m);
-    CHECK(!r.ok, "old log data must now be rejected");
-    printf("  field data -> %s\n", r.message);
-  }
-  {  // consistent small drift is accepted
-    Vec3 m[4] = {ax * 80.0f, ax * -78.5f, ax * 81.0f, ax * -80.0f};
-    CalibrationResult r = validateCalibration(m);
     CHECK(r.ok, "%s", r.message);
-    CHECK(fabsf(r.openAngleDeg - 79.9f) < 1.0f);
+    CHECK(fabsf(r.openAngleDeg - 67.0f) < 0.1f);
     CHECK(dot(r.axis, ax) > 0.999f);
   }
-  {  // rounds differ too much
-    Vec3 m[4] = {ax * 60.0f, ax * -59.0f, ax * 80.0f, ax * -79.0f};
+  {  // negligible movement
+    Vec3 m[4] = {ax * 5.0f, ax * -5.0f, ax * 5.0f, ax * -5.0f};
     CalibrationResult r = validateCalibration(m);
     CHECK(!r.ok);
-    printf("  repeatability -> %s\n", r.message);
+    printf("  negligible -> %s\n", r.message);
   }
-  {  // too small a movement
-    Vec3 m[4] = {ax * 10.0f, ax * -10.0f, ax * 10.0f, ax * -10.0f};
+  {  // one tiny movement among good ones
+    Vec3 m[4] = {ax * 60.0f, ax * -60.0f, ax * 60.0f, ax * -4.0f};
     CHECK(!validateCalibration(m).ok);
   }
-  {  // opening and closing about different axes (loose sensor / twist)
-    Vec3 other = normalized(Vec3(0.9f, -0.3f, 0.1f));
-    Vec3 m[4] = {ax * 60.0f, other * -60.0f, ax * 60.0f, other * -60.0f};
-    CHECK(!validateCalibration(m).ok);
-  }
-  {  // "close" in the same direction as "open"
+  {  // "close" turns the same way as "open"
     Vec3 m[4] = {ax * 60.0f, ax * 60.0f, ax * 60.0f, ax * 60.0f};
+    CalibrationResult r = validateCalibration(m);
+    CHECK(!r.ok);
+    printf("  same direction -> %s\n", r.message);
+  }
+  {  // different axes
+    Vec3 other = normalized(Vec3(1.0f, -0.2f, -0.3f));  // ~90 deg from ax
+    Vec3 m[4] = {ax * 60.0f, ax * -60.0f, other * 60.0f, other * -60.0f};
     CHECK(!validateCalibration(m).ok);
+  }
+  {  // sizes more than 40 % from the average (original rule)
+    Vec3 m[4] = {ax * 30.0f, ax * -30.0f, ax * 100.0f, ax * -100.0f};
+    CalibrationResult r = validateCalibration(m);
+    CHECK(!r.ok);
+    printf("  inconsistent sizes -> %s\n", r.message);
+  }
+  {  // opposite-sign (door opens the other way round) is fine: the axis flips so "opening" is positive
+    Vec3 m[4] = {ax * -60.0f, ax * 60.0f, ax * -60.0f, ax * 60.0f};
+    CalibrationResult r = validateCalibration(m);
+    CHECK(r.ok && dot(r.axis, ax) < -0.999f);
   }
 }
 
 static void test_calibration_session() {
-  printf("calibration session\n");
+  printf("calibration session (immediate button presses)\n");
   Vec3 ax = normalized(axisA());
   CalibrationSession c;
   CHECK(c.round() == 1 && c.expectingOpen());
-  CHECK(c.accept(ax * 64.7f) == CalibrationSession::Outcome::Saved);
-  CHECK(!c.expectingOpen());
-  // round 1 closes with 17.6 deg drift -> round rejected immediately
-  CHECK(c.accept(ax * -47.1f) == CalibrationSession::Outcome::RoundFailed);
-  CHECK(c.awaitingRestart() && c.round() == 1);
-  printf("  prompt: %s\n", c.result().message);
-  CHECK(c.accept(Vec3()) == CalibrationSession::Outcome::RestartAccepted);
-  CHECK(c.accept(ax * 70.0f) == CalibrationSession::Outcome::Saved);
-  CHECK(c.accept(ax * -69.0f) == CalibrationSession::Outcome::Saved);
-  CHECK(c.round() == 2);
-  CHECK(c.accept(ax * 71.0f) == CalibrationSession::Outcome::Saved);
-  CHECK(c.accept(ax * -70.0f) == CalibrationSession::Outcome::Complete);
+  CHECK(c.press(ax * 64.7f) == CalibrationSession::Outcome::Saved);
+  CHECK(c.round() == 1 && !c.expectingOpen());
+  CHECK(c.press(ax * -47.1f) == CalibrationSession::Outcome::Saved);
+  CHECK(c.round() == 2 && c.expectingOpen());
+  CHECK(c.press(ax * 84.4f) == CalibrationSession::Outcome::Saved);
+  CHECK(c.press(ax * -71.9f) == CalibrationSession::Outcome::Complete, "four presses, then done");
   CHECK(c.result().ok);
 
-  CalibrationSession d;  // repeatability failure restarts at round 1
-  d.accept(ax * 60.0f);
-  d.accept(ax * -59.0f);
-  d.accept(ax * 85.0f);
-  CHECK(d.accept(ax * -84.0f) == CalibrationSession::Outcome::Failed);
-  CHECK(d.round() == 1 && d.awaitingRestart());
+  CalibrationSession d;  // inconsistent: starts the four presses again, nothing else gates it
+  d.press(ax * 60.0f);
+  d.press(ax * 60.0f);
+  d.press(ax * 60.0f);
+  CHECK(d.press(ax * 60.0f) == CalibrationSession::Outcome::Failed);
+  CHECK(d.round() == 1 && d.expectingOpen());
+  printf("  message: %s\n", d.result().message);
+  d.press(ax * 60.0f);
+  d.press(ax * -58.0f);
+  d.press(ax * 62.0f);
+  CHECK(d.press(ax * -61.0f) == CalibrationSession::Outcome::Complete);
 }
 
-static void test_settle_gate() {
-  printf("settle gate and capture\n");
-  SettleGate g(500, 4000);
-  CHECK(g.service(0, true) == SettleGate::Result::Idle);
-  CHECK(g.begin(1000) && !g.begin(1100));
-  CHECK(g.service(1100, true) == SettleGate::Result::Pending, "never confirm before the minimum settle time");
-  CHECK(g.service(1499, true) == SettleGate::Result::Pending);
-  CHECK(g.service(1600, false) == SettleGate::Result::Pending);
-  CHECK(g.service(1700, true) == SettleGate::Result::Confirmed);
-  CHECK(!g.active());
-  g.begin(0);
-  CHECK(g.service(3999, false) == SettleGate::Result::Pending);
-  CHECK(g.service(4000, false) == SettleGate::Result::TimedOut);
-  g.begin(10);
-  g.cancel();
-  CHECK(!g.active());
-
-  // CalibrationSession: capture waits, includes motion during settling, timeout keeps state.
-  Vec3 ax = normalized(axisA());
-  CalibrationSession c;
-  CHECK(c.requestCapture(1000, ax * 60.0f));
-  CHECK(!c.requestCapture(1010, ax * 60.0f));
-  CHECK(c.service(1200, true, ax * 60.0f) == CalibrationSession::Outcome::Pending);
-  CHECK(c.service(1600, true, ax * 62.0f) == CalibrationSession::Outcome::Saved);
-  CHECK(fabsf(c.settleMotionDeg() - 2.0f) < 0.01f);
-  CHECK(!c.capturing() && !c.expectingOpen());
-  CHECK(c.requestCapture(2000, ax * -60.0f));
-  CHECK(c.service(6000, false, ax * -60.0f) == CalibrationSession::Outcome::SettleTimeout);
-  CHECK(!c.capturing() && !c.expectingOpen(), "timeout must not consume the step");
-  CHECK(c.requestCapture(7000, ax * -60.0f));
-}
-
-// Estimator: tolerant of tremor and a button bump, but not of a slow steady turn.
-static void test_settled_detection() {
-  printf("settled detection\n");
-  Vec3 trueBias(0.3f, -0.2f, 0.1f);
-  Sim s(40, axisA(), trueBias, 0.08f);
+// Whole workflow on simulated data: bias average, 4 presses, angle = 0, monitoring, manual reset.
+static void test_full_calibration_flow() {
+  printf("full calibration flow (simulated)\n");
+  Vec3 trueBias(0.7f, -0.4f, 0.3f);
+  Sim s(60, axisA(), trueBias, 0.08f);
   DoorEstimator e;
-  e.setBias(trueBias);
-  float t = 0;
-  auto step = [&](float rate, float seconds, float tremor) {
-    int n = (int)(seconds / 0.02f + 0.5f);
-    for (int i = 0; i < n; i++) {
-      Vec3 g = s.sample(rate) + Vec3(tremor * sinf(6.2832f * 8 * t), tremor * sinf(6.2832f * 8 * t + 2), tremor * sinf(6.2832f * 8 * t + 4));
-      e.step(g, 0.02f);
-      t += 0.02f;
-    }
-  };
-  step(0, 0.3f, 1.0f);
-  CHECK(!e.settled(), "not enough data yet");
-  step(0, 0.5f, 1.0f);
-  CHECK(e.settled(), "tremor of ~0.7 dps rms must count as settled");
-  step(30.0f, 0.06f, 0);  // button bump
-  CHECK(!e.settled());
-  step(0, 0.3f, 0.5f);
-  CHECK(!e.settled(), "bump still inside the 0.5 s window");
-  step(0, 0.4f, 0.5f);
-  CHECK(e.settled(), "settles after the bump leaves the window");
-  step(4.0f, 1.0f, 0);   // slow steady turn: low variance but real rotation
-  CHECK(!e.settled(), "slow steady rotation must NOT count as still");
-}
+  BiasAverager avg;
+  while (!avg.add(s.sample(0))) {}
+  e.setBias(avg.bias());
 
-// Whole flow on simulated data: open, press (with a bump), settle, saved with correct angle.
-static void test_capture_with_button_bump() {
-  printf("capture with button bump\n");
-  Vec3 trueBias(0.4f, 0.2f, -0.3f);
-  Sim s(50, axisA(), trueBias, 0.08f);
-  DoorEstimator e;
-  e.setBias(trueBias);
   CalibrationSession c;
-  uint32_t ms = 0;
-  auto tick = [&](float rate, Vec3 extra = Vec3()) {
-    e.step(s.sample(rate) + extra, 0.02f);
-    ms += 20;
-  };
-  for (int i = 0; i < 50; i++) tick(0);
-  for (int i = 0; i < 75; i++) tick(40.0f);            // open 60 deg in 1.5 s
-  for (int i = 0; i < 25; i++) tick(0);
-  CHECK(c.requestCapture(ms, e.rotation()));
-  uint32_t pressAt = ms;
-  // the press bumps the sensor: +/-25 dps for ~60 ms, and a little real drift of the door
-  for (int i = 0; i < 3; i++) tick(0, Vec3(25, 25, 25));
-  for (int i = 0; i < 3; i++) tick(0, Vec3(-25, -25, -25));
-  CalibrationSession::Outcome o = CalibrationSession::Outcome::Pending;
-  uint32_t doneAt = 0;
-  for (int i = 0; i < 200 && o == CalibrationSession::Outcome::Pending; i++) {
-    tick(0);
-    o = c.service(ms, e.settled(), e.rotation());
-    if (o != CalibrationSession::Outcome::Pending) doneAt = ms;
+  CalibrationSession::Outcome o = CalibrationSession::Outcome::Saved;
+  const float targets[4] = {70, 0, 72, 0};
+  for (int i = 0; i < 4; i++) {
+    moveTo(s, e, targets[i], 1.5f);
+    hold(s, e, 1.0f);
+    Vec3 rot = e.rotation();
+    e.resetRotation();
+    o = c.press(rot);  // the press is accepted immediately
   }
-  CHECK(o == CalibrationSession::Outcome::Saved);
-  CHECK(doneAt - pressAt >= cfg::SETTLE_MS && doneAt - pressAt < 1500, "confirmed after %u ms", doneAt - pressAt);
-  float measured = magnitude(e.rotation());
-  CHECK(fabsf(measured - 60.0f) < 2.0f, "endpoint = %.2f deg (bump must not contaminate)", measured);
+  CHECK(o == CalibrationSession::Outcome::Complete, "%s", c.result().message);
+  CHECK(fabsf(c.result().openAngleDeg - 71.0f) < 3.0f, "open angle %.1f", c.result().openAngleDeg);
+  e.setCalibration(c.result().axis, c.result().openAngleDeg);
+  e.zero(ClosureSource::Manual);
+  CHECK(e.angle() == 0 && e.estimatedClosed() && e.closureSource() == ClosureSource::Manual);
+  CHECK(e.biasAdjustments() == 0, "no bias refinement during calibration");
+
+  // monitoring works with the learned axis
+  s.trueAngle = 0;
+  moveTo(s, e, 60, 2.0f);
+  hold(s, e, 1.0f);
+  CHECK(!e.estimatedClosed() && fabsf(e.angle() - 60.0f) < 3.0f, "angle=%.1f", e.angle());
+
+  // Button 1 after calibration: manual reset of the closed reference AND the alarm
+  AlarmTimer alarm(10000);
+  uint32_t ms = 0;
+  alarm.update(ms, DoorState::Open);
+  CHECK(alarm.update(ms + 10000, DoorState::Open) == AlarmTimer::Event::Started);
+  e.zero(ClosureSource::Manual);
+  DoorInputs in = {false, false, false, true, e.calibrated(), e.estimatedClosed()};
+  CHECK(e.angle() == 0 && resolveDoorState(in) == DoorState::Closed);
+  CHECK(alarm.update(ms + 10020, resolveDoorState(in)) == AlarmTimer::Event::Stopped);
+  CHECK(!alarm.active() && !alarm.running());
+}
+
+static void test_no_adaptation_before_calibration() {
+  printf("calibration phase is plain integration\n");
+  Sim s(70, axisA(), Vec3(0, 0, 0), 0.05f);
+  DoorEstimator e;
+  e.setBias(Vec3(0, 0, 0));
+  run(s, e, 10.0f, 0, 0.02f);  // 10 s at rest with a true 0 offset
+  CHECK(e.biasAdjustments() == 0);
+  DoorEstimator f;
+  f.setBias(Vec3(0, 0, 0));
+  Sim t(71, axisA(), Vec3(1.0f, 0, 0), 0.05f);  // uncorrected 1 dps offset on X
+  run(t, f, 10.0f, 0, 0.02f);
+  CHECK(f.biasAdjustments() == 0, "no hidden bias adjustment while calibrating");
+  CHECK(fabsf(f.rotation().x - 10.0f) < 0.5f, "rotation.x=%.2f (pure integral)", f.rotation().x);
 }
 
 static void test_alarm() {
@@ -602,13 +463,11 @@ static void test_end_to_end_alarm() {
 }
 
 int main() {
-  test_trimmed_mean();
-  test_bias_measurement();
+  test_bias_average();
   test_calibration_validation();
   test_calibration_session();
-  test_settle_gate();
-  test_settled_detection();
-  test_capture_with_button_bump();
+  test_full_calibration_flow();
+  test_no_adaptation_before_calibration();
   test_alarm();
   test_door_state_resolution();
   test_debouncer();

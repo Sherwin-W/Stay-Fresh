@@ -26,50 +26,14 @@
 
 namespace cfg {
 
-// ====================================================================
-//  CALIBRATION TUNING: START HERE if calibration feels too strict/loose
-// ====================================================================
-// These are STARTING VALUES chosen from simulation and typical MPU6050
-// behaviour. They are not validated on your hardware. Watch the Serial
-// monitor ("calmest window ...") and adjust one number at a time.
-//
-// Gyro units are degrees/second (dps). A resting MPU6050 shows noise
-// around 0.05-0.15 dps; a hand holding the door adds tremor, typically
-// well under 1 dps rms; a bumped button gives a short spike of tens of dps.
-
 constexpr uint32_t SAMPLE_US = 20000;           // gyro poll period: 20 ms = 50 Hz
 
-// Stability window: how much recent data is judged "still enough".
-constexpr uint32_t STILL_WINDOW_MS = 1000;      // ms. Longer = steadier decision, slower to resume after a bump.
-constexpr float STILL_MAX_STD_DPS = 1.0f;       // dps. Allowed per-axis spread (std dev) inside the window.
-                                                //   TOO STRICT? raise to 1.5-2.5. Rotation at 5+ dps will
-                                                //   still fail, but a sustained slow turn (see below) will not.
-// Sustained movement: window average vs. the samples already accepted.
-constexpr float STILL_MAX_SHIFT_DPS = 0.5f;     // dps. Window mean may differ from the accepted pool by this much.
-constexpr float SHIFT_RESTART_S = 8.0f;         // s. Restart the pool only if the shift persists this long
-                                                //   (offset really changed). Shorter shifts just pause.
-// Bias measurement.
-constexpr uint32_t WARMUP_MS = 3000;            // ms discarded first (sensor self-heating)
-constexpr uint32_t BIAS_REQUIRED_ACCEPTED_MS = 5000;  // ms of ACCEPTED (steady) samples needed
-constexpr uint32_t BIAS_MAX_WAIT_MS = 30000;    // ms total (incl. warm-up) before giving up and offering a retry
-constexpr float BIAS_TRIM_FRACTION = 0.10f;     // drop this fraction from EACH end per axis before averaging
-constexpr float BIAS_MAX_HALF_DIFF_DPS = 0.5f;  // dps. 1st vs 2nd half of the pool must agree (else: still drifting)
-constexpr float BIAS_MAX_ABS_DPS = 10.0f;       // dps. Largest average rate accepted as an OFFSET. A steady rotation
-                                                //   has low variability, so only this cap rejects fast constant turns.
-                                                //   Datasheet allows +/-20 raw; typical parts are within a few dps.
-                                                //   If a healthy unit is rejected as 'implausibly large', raise toward 20.
-
-// Button presses (confirming the open/closed position, or manual zero).
-constexpr uint32_t SETTLE_MS = 500;             // ms to wait after the press before trusting the position
-constexpr uint32_t SETTLE_TIMEOUT_MS = 4000;    // ms to wait for it to steady before asking you to press again
-constexpr uint32_t CAPTURE_WINDOW_MS = 500;     // ms of recent data that must look steady to confirm
-constexpr float CAPTURE_MAX_MEAN_DPS = 1.5f;    // dps. Average rotation allowed while confirming a position
-
-constexpr int STILL_WINDOW_N = (int)(STILL_WINDOW_MS * 1000UL / SAMPLE_US);
-constexpr int CAPTURE_N = (int)(CAPTURE_WINDOW_MS * 1000UL / SAMPLE_US);
-constexpr int POOL_MAX = (int)(BIAS_REQUIRED_ACCEPTED_MS * 1000UL / SAMPLE_US) + 60;
-static_assert(CAPTURE_N <= STILL_WINDOW_N, "capture window must fit inside the stability window");
-// ====================================================================
+// ---- Calibration (simple, button-guided) ---------------------------
+constexpr int BIAS_SAMPLES = 100;               // gyro samples averaged for the offset (~2 s)
+constexpr float BIAS_NOISY_RANGE_DPS = 8.0f;    // dps. Only prints a NOTE if the sensor moved this much; never blocks
+constexpr float CAL_MIN_MOVE_DEG = 10.0f;       // deg. Each open/close movement must be at least this
+constexpr float CAL_MAX_DEVIATION = 0.40f;      // each movement within 40 % of the average size
+constexpr float CAL_MIN_ALIGNMENT = 0.80f;      // cos(angle) between a movement and the hinge axis (about 37 deg; a real hinge turn scores ~0.98)
 
 // ---- Pins ----------------------------------------------------------
 constexpr int I2C_SDA = 21;
@@ -113,14 +77,6 @@ constexpr float ADAPT_MAX_PEAK_DPS = 2.5f;    // any sample vs current bias
 constexpr float ADAPT_MAX_MEAN_DPS = 1.5f;    // |mean residual| must be small
 constexpr float ADAPT_GAIN = 0.7f;            // move this fraction per block
 constexpr float ADAPT_MAX_TOTAL_DPS = 3.0f;   // never drift >3 dps from calibration
-
-// ---- Calibration validation ----------------------------------------
-constexpr float CAL_MIN_MOVE_DEG = 20.0f;
-constexpr float CAL_MIN_ALIGNMENT = 0.92f;    // cos(angle to hinge axis)
-constexpr float CAL_MAX_CLOSURE_ABS_DEG = 4.0f;  // |open - close| per round
-constexpr float CAL_MAX_CLOSURE_REL = 0.05f;
-constexpr float CAL_MAX_REPEAT_ABS_DEG = 5.0f;   // round 1 vs round 2
-constexpr float CAL_MAX_REPEAT_REL = 0.08f;
 
 // ---- Cloud ----------------------------------------------------------
 constexpr int REED_ACTIVE_STATE_CLOSED = 0;   // LOW = magnet near = closed

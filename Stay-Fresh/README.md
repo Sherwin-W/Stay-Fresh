@@ -28,43 +28,25 @@ pio run -t upload && pio device monitor   # flash + 115200 baud
 ```
 
 ### Startup / calibration (Serial Monitor, 115200)
-Nobody can hold a sensor perfectly still, so "still enough" is judged from **variability**, not from zero readings (a resting gyro has a non-zero offset anyway).
+The simple, button-guided process. There are no stability gates, settling delays or automatic restarts.
 
-**Step 1: gyro offset (door closed).** 3 s warm-up (discarded), then the firmware gathers 5 s of *accepted* steady samples. Every 20 ms it looks at the last 1 s of data:
-* *Steady* if each axis's standard deviation is ≤ `STILL_MAX_STD_DPS` (1.0 dps) and the window's average is within `STILL_MAX_SHIFT_DPS` (0.5 dps) of the samples already accepted.
-* *Not steady* (a bump, a button press, a sustained turn): collection **pauses** ("Movement detected; pausing briefly."). Samples already accepted are **kept**, and collection resumes when the window settles ("Steady again; resuming."). Nothing restarts.
-* The pool is discarded only if the average stays shifted for `SHIFT_RESTART_S` (8 s), meaning the offset itself moved (e.g. still warming up).
-* The offset is a **trimmed mean** per axis: sort, drop the lowest and highest 10 % (`BIAS_TRIM_FRACTION`), average the rest, so a few leftover spikes cannot drag it. The two halves of the pool must agree within 0.5 dps, otherwise the older half is dropped and collection continues.
-* Progress is printed as `Calibration: 65%` (at most every 1.5 s). Messages are rate-limited.
-* **Timeout:** after `BIAS_MAX_WAIT_MS` (30 s) it stops, prints *why* (e.g. "only 1.2 of 5.0 s were steady enough; the calmest 1 s window varied by 1.4 dps, limit 1.0"), accepts nothing, and waits. **Press Button 1 or send `c`** to retry. The door stays `unknown` until it succeeds.
+1. **Gyro offset.** Door closed, "reasonably still". The firmware averages `BIAS_SAMPLES` = 100 gyro samples (about 2 s). Perfect stillness is not required and this step never restarts. If the sensor clearly moved it only prints a note (send `c` to redo).
+2. **OPEN** the door to your normal open position. *Hold it still, then press Button 1.* The movement is saved the instant the (debounced) press is seen.
+3. **CLOSE** the door completely. *Hold it still, then press Button 1.* Saved immediately.
+4. Repeat 2-3 once more: four presses in total.
+5. The four movement vectors give the hinge axis and opening direction. Basic checks only (`config.h`): each movement at least 10° (`CAL_MIN_MOVE_DEG`); each turns the right way about roughly the same axis (`CAL_MIN_ALIGNMENT`); no movement more than 40 % from the average size (`CAL_MAX_DEVIATION`). If a check fails you are told which one and the four presses start again.
+6. After the final closing press the angle is set to **0°** and monitoring starts.
 
-**Step 2: open/close positions (2 rounds).** OPEN → press Button 1 → CLOSE fully → press Button 1, twice.
-* A press only *starts* a capture. After `SETTLE_MS` (0.5 s) the position is saved as soon as the last `CAPTURE_WINDOW_MS` (0.5 s) looks steady (variability ≤ limit **and** average rotation ≤ `CAPTURE_MAX_MEAN_DPS`). So a button bump leaves the endpoint alone, while a continuing slow turn is not mistaken for "settled".
-* Rotation is integrated the whole time. Real motion during settling is included, and if it is > 1.5° you are told ("Position saved." plus a note).
-* If it cannot settle within `SETTLE_TIMEOUT_MS` (4 s) you're asked to press again. Nothing is consumed or lost.
-* Each round is validated as before (open vs close mismatch ≤ max(4°, 5 %); rounds agree within max(5°, 8 %); same hinge axis) with specific retry prompts.
-* Manual re-zero on a closed door (Button 1 after calibration) uses the same settle step.
-* Send `c` any time to recalibrate without reflashing.
+Angle integration is continuous (also during the calibration movements). Failed MPU reads are skipped and never counted as samples.
 
-### Tuning calibration sensitivity
-All values are at the **top of `include/config.h`** ("CALIBRATION TUNING"). They are starting points from simulation, **not validated on your hardware**. Change one at a time and watch the monitor.
+**Button 1 after calibration** sets the closed reference to 0° and (in gyro mode) resets the alarm and its timer. **Press it only when the door is physically closed.** It is your assertion, not a measurement. With the reed switch enabled the contact, not the button, decides open/closed and the alarm.
+Send `c` over Serial any time to recalibrate without reflashing.
 
-| Symptom | Adjust | Initial → try |
-|---|---|---|
-| Keeps pausing / times out with "calmest window varied by X" | `STILL_MAX_STD_DPS`: set a little above the "calmest window" X printed in the timeout message | 1.0 → 1.5–2.5 dps |
-| Pauses right after a bump take too long to resume | `STILL_WINDOW_MS` (shorter) | 1000 → 600 ms |
-| "Steady again" never comes even though still (offset changing) | `STILL_MAX_SHIFT_DPS` | 0.5 → 0.8 dps |
-| Takes too long overall | `BIAS_REQUIRED_ACCEPTED_MS` (less data, noisier offset) | 5000 → 3000 ms |
-| Gives up before it can finish | `BIAS_MAX_WAIT_MS` | 30000 → 60000 ms |
-| Button press never settles | `CAPTURE_MAX_MEAN_DPS`, `SETTLE_TIMEOUT_MS` | 1.5 → 2.5 dps; 4000 → 6000 ms |
-| Healthy unit rejected as "implausibly large" offset | `BIAS_MAX_ABS_DPS` | 10 → up to 20 dps |
+> History: a stricter calibration (rolling stability windows, trimmed mean, settle delays, tighter open/close consistency) was tried and removed because it was too hard to complete by hand. This simple process accepts what the stricter one rejected, e.g. open/close of 64.7° / 47.1° / 84.4° / 71.9° passes. That is more convenient, **not more accurate**.
 
-Don't loosen the limits indefinitely: it hides drift and lets slow movement through (below).
-
-### Limits you should know about (physics, not tuning)
-* **A gyro turning at a constant slow rate looks exactly like a gyro with a constant offset.** The tests include a case that shows this: a perfectly constant 2 dps turn from the very first sample is accepted as offset. What *is* caught: rotation above the plausibility cap (`BIAS_MAX_ABS_DPS`), anything with variability above the limit, turns that start or stop during collection (the window mean shifts, so it pauses and the old samples are kept), and a bad offset shows up as an open/close mismatch in step 2. A creeping turn slower than `STILL_MAX_SHIFT_DPS` (0.5 dps = 30°/min) can be absorbed.
-* **Stationary ≠ closed.** Nothing here zeroes the angle when motion stops. The angle is zeroed only by a button press on a door *you* say is closed (manual) or a reed/Hall contact. The closed threshold is still 5°; it was not widened to hide drift.
-* Raising the variability limit trades tolerance for the ability to notice real movement. A reed switch remains the only reliable closure signal.
+### What this does NOT fix: gyro drift
+This restores an easier workflow; it does not reduce drift. Averaging 100 samples only gives an approximate offset (a bump or tremor adds error), and any residual offset is integrated into the angle. The angle and the gyro-based open/closed state are **estimates**; expect them to wander, and a closed door may read open (alarm stuck on) until you press Button 1 on a closed door.
+Still in place from earlier work, and unchanged by this calibration: the 5° closed / 7° open hysteresis (not widened to hide drift), the −3° frame clamp, drift-labelled telemetry, missed-sample accounting, and bias refinement during carefully detected still periods **after** calibration completes (it is not active during calibration). The angle is never zeroed just because motion stops. The only reliable closure signal is the optional reed/Hall sensor below.
 
 ### States (never silently "closed")
 | Thing | Values |
@@ -129,20 +111,19 @@ Temperature honesty: the BMP280 measures **where it is mounted**. On the outside
 | Item | Status |
 |---|---|
 | Firmware compiles (default, reed on, extended on) | ✅ `pio run`, no errors |
-| Logic: rolling-window bias measurement (tremor, bumps, deliberate rotation, offset step, timeout), trimmed mean, settle gate and button-bump capture, calibration validation, drift/adaptation, gaps, alarm transitions, debouncing, state resolution | ✅ 546 host-side checks on *simulated* gyro data |
+| Logic: 100-sample bias average, the four-press calibration flow and its basic checks, drift/adaptation, gaps, alarm transitions (incl. manual reset stops alarm), debouncing, state resolution | ✅ 502 host-side checks on *simulated* gyro data |
 | Dashboard typecheck, build, 20 tests (login failure, empty, stale, missing temp, unknown door, fetch error, demo isolation) | ✅ |
 | Layout at desktop and 390 px, dark mode | ✅ viewed via headless Chrome (demo data) |
 | Anonymous DB access denied | ✅ live request |
 | Authenticated owner read; extended inserts; migration | ⬜ not run (needs your login / your approval) |
 | **Any behavior on real hardware** (sensor noise, real drift, buzzer, button, reed, Wi-Fi loss) | ⬜ **not tested** |
 
-Threshold values in `config.h` are engineering estimates from simulation, not tuned on your sensor. Expect to adjust them after the checklist.
+Threshold values in `config.h` are engineering estimates from simulation, not tuned on your sensor.
 
 ## Hardware test checklist
 Record serial output for each. ☐ = pass/fail.
-1. ☐ Boot: warm-up, then `Calibration: N%` climbing. Hold the board lightly in your hand: small tremor should still complete. Tap the table: "Movement detected; pausing briefly." then it **resumes** (percent not reset). Rotate the board steadily for the whole period: must time out after 30 s with a reason and no calibration. Press Button 1 to retry.
-   Note the "calmest window" number in any timeout message and compare with `STILL_MAX_STD_DPS`.
-2. ☐ Calibration: press Button 1 firmly at each position: it should say "settling…" then "Position saved." without the press changing the measured angle (compare a press vs. releasing the door first). Good run accepted; deliberately close only halfway in a round → rejected with a clear message; retry works.
+1. ☐ Boot: "Measuring gyro offset…" completes in about 2 s even with the board lightly held, then the OPEN prompt appears.
+2. ☐ Calibration: four presses, each acknowledged at once ("Saved movement: N degrees"); then "Calibration complete" and angle 0. Try closing only partway in one press: movement-size check should reject and restart the four presses.
 3. ☐ Slow opening (~10 s to 60°): angle tracks, door goes `open` past 7°.
 4. ☐ Fast opening (<1 s), then fast closing.
 5. ☐ Pause mid-swing 5 s, continue: angle continues, no jump; door still `open`.

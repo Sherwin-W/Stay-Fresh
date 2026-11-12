@@ -24,7 +24,7 @@ Adafruit_BMP280 bmp;
 bool bmpReady = false;
 bool mpuReady = false;
 
-BiasMeasurement biasMeasurement;
+BiasAverager biasAverager;
 DoorEstimator door;
 CalibrationSession calibration;
 AlarmTimer alarmTimer(cfg::DOOR_OPEN_LIMIT_MS);
@@ -96,68 +96,21 @@ bool readGyro(Vec3& g) {
 // Prompts
 // ------------------------------------------------------------
 void printCalibrationPrompt() {
-  if (calibration.awaitingRestart()) {
-    Serial.printf("Fully CLOSE the door, hold it reasonably still, then press Button 1 to retry round %d.\n",
-                  calibration.round());
-    return;
-  }
   Serial.printf("\nCalibration round %d of 2\n", calibration.round());
   Serial.println(calibration.expectingOpen()
                      ? "OPEN the door to your normal open position."
                      : "CLOSE the door completely.");
-  Serial.println("Hold it reasonably still, then press Button 1.");
+  Serial.println("Hold it still, then press Button 1.");
 }
-
-// Rate limiting: returns true at most once per everyMs (and the first time).
-bool due(uint32_t& last, uint32_t nowMs, uint32_t everyMs) {
-  if (last != 0 && nowMs - last < everyMs) return false;
-  last = nowMs ? nowMs : 1;
-  return true;
-}
-
-BiasMeasurement::Status prevBiasStatus = BiasMeasurement::Status::Collecting;
-uint32_t lastPauseMsgMs = 0, lastProgressMs = 0, lastSettleMsgMs = 0;
-int lastPercent = -1;
-bool pauseAnnounced = false;
-SettleGate zeroGate(cfg::SETTLE_MS, cfg::SETTLE_TIMEOUT_MS);
 
 void startBiasMeasurement() {
-  calState = CalState::Warmup;
-  biasMeasurement.restart();
+  calState = CalState::Bias;
+  biasAverager.reset();
   door.clearAll();
   calibration.begin();
-  zeroGate.cancel();
-  prevBiasStatus = BiasMeasurement::Status::Collecting;
-  lastPauseMsgMs = lastProgressMs = 0;
-  lastPercent = -1;
-  pauseAnnounced = false;
-  Serial.println("Keep the door CLOSED. Hold reasonably still: small vibrations are okay.");
-  Serial.printf("Warming up %lu s, then collecting %lu s of steady samples (gives up after %lu s).\n",
-                (unsigned long)(cfg::WARMUP_MS / 1000UL),
-                (unsigned long)(cfg::BIAS_REQUIRED_ACCEPTED_MS / 1000UL),
-                (unsigned long)(cfg::BIAS_MAX_WAIT_MS / 1000UL));
-}
-
-// Readable, rate-limited progress for the offset measurement.
-void biasFeedback(BiasMeasurement::Status st, uint32_t nowMs) {
-  if (st == BiasMeasurement::Status::Paused && prevBiasStatus != BiasMeasurement::Status::Paused) {
-    if (due(lastPauseMsgMs, nowMs, 2000)) {
-      Serial.println("Movement detected; pausing briefly.");
-      if (biasMeasurement.pauses() % 3 == 0) Serial.println("Hold reasonably still: small vibrations are okay.");
-      pauseAnnounced = true;
-    }
-  } else if (st == BiasMeasurement::Status::Collecting && prevBiasStatus == BiasMeasurement::Status::Paused &&
-             pauseAnnounced) {
-    Serial.println("Steady again; resuming.");
-    pauseAnnounced = false;
-  }
-  prevBiasStatus = st;
-
-  int pct = biasMeasurement.percent();
-  if (!biasMeasurement.inWarmup() && pct != lastPercent && due(lastProgressMs, nowMs, 1500)) {
-    Serial.printf("Calibration: %d%%\n", pct);
-    lastPercent = pct;
-  }
+  Serial.println("Keep the door CLOSED and reasonably still.");
+  Serial.printf("Measuring gyro offset from %d samples (about %lu seconds)...\n", cfg::BIAS_SAMPLES,
+                (unsigned long)(cfg::BIAS_SAMPLES * cfg::SAMPLE_US / 1000000UL));
 }
 
 // ------------------------------------------------------------
@@ -170,7 +123,7 @@ void pollGyro() {
   if ((int32_t)(nowUs - nextSampleUs) > 0) nextSampleUs = nowUs + cfg::SAMPLE_US;  // fell behind: resync
 
   Vec3 g;
-  if (!readGyro(g)) {
+  if (!readGyro(g)) {  // failed reads are skipped; they never count as samples
     failedReads++;
     uint32_t nowMs = millis();
     // A brown-out can reset the MPU6050 into sleep mode: re-configure it.
@@ -189,32 +142,22 @@ void pollGyro() {
   lastGoodMs = millis();
   haveGoodSample = true;
 
-  if (calState == CalState::Warmup || calState == CalState::Bias) {
-    BiasMeasurement::Status st = biasMeasurement.add(g, dt);
-    if (calState == CalState::Warmup && !biasMeasurement.inWarmup()) {
-      calState = CalState::Bias;
-      Serial.println("Warm-up done; collecting steady samples.");
-    }
-    if (st == BiasMeasurement::Status::Done) {
-      door.setBias(biasMeasurement.bias());
+  // Step 1: average the gyro offset (no stillness gate, no restarts).
+  if (calState == CalState::Bias) {
+    if (biasAverager.add(g)) {
+      door.setBias(biasAverager.bias());
       calState = CalState::Moves;
-      Serial.printf("Gyro offset OK (%.2f, %.2f, %.2f deg/s) from %d steady samples; %lu pause(s) along the way.\n",
-                    biasMeasurement.bias().x, biasMeasurement.bias().y, biasMeasurement.bias().z,
-                    biasMeasurement.samples(), (unsigned long)biasMeasurement.pauses());
+      Serial.println("Gyroscope offset calibration complete.");
+      if (biasAverager.noisy()) {
+        Serial.println("Note: the sensor moved noticeably while measuring. If the angle drifts a lot, send 'c' to redo.");
+      }
       printCalibrationPrompt();
-    } else if (st == BiasMeasurement::Status::TimedOut) {
-      // Never accept an unreliable offset and never wait forever.
-      calState = CalState::Fault;
-      Serial.printf("\nCalibration timed out: %s\n", biasMeasurement.reason());
-      Serial.println("Nothing was accepted. Press Button 1 or send 'c' over Serial to retry.");
-    } else {
-      biasFeedback(st, millis());
     }
     return;
   }
 
-  if (calState == CalState::Fault) return;  // calibration failed: wait for a retry
-
+  // From here on the angle is integrated continuously (also during the
+  // calibration movements, which accumulate in door.rotation()).
   DoorEstimator::StepResult r = door.step(g, dt);
   if (r.biasAdapted) {
     Serial.printf("Gyro offset refined during a still period (adjustment #%lu).\n",
@@ -223,85 +166,50 @@ void pollGyro() {
 }
 
 // ------------------------------------------------------------
-// Button: starts a capture; the position is saved once it settles.
+// Button 1: every debounced press is accepted immediately.
 // ------------------------------------------------------------
-void handleButtonPress(uint32_t nowMs) {
+void handleButtonPress() {
   if (!mpuReady) return;
 
-  if (calState == CalState::Fault) {
-    Serial.println("Retrying calibration...");
-    startBiasMeasurement();
+  if (calState == CalState::Bias) {
+    Serial.println("Still measuring the gyro offset; wait for the prompt.");
     return;
   }
-  if (calState == CalState::Warmup || calState == CalState::Bias) {
-    Serial.println("Still collecting the gyro offset; wait for the calibration prompt.");
-    return;
-  }
+
   if (calState == CalState::Moves) {
-    if (calibration.requestCapture(nowMs, door.rotation()))
-      Serial.println("Button pressed: settling... keep the door steady for a moment.");
+    Vec3 rotation = door.rotation();
+    door.resetRotation();
+    CalibrationSession::Outcome o = calibration.press(rotation);
+    Serial.printf("Saved movement: %.1f degrees\n", magnitude(rotation));
+
+    if (o == CalibrationSession::Outcome::Saved) {
+      printCalibrationPrompt();
+    } else if (o == CalibrationSession::Outcome::Failed) {
+      Serial.printf("\nCalibration was inconsistent: %s\n", calibration.result().message);
+      Serial.println("Start CLOSED. Use the same open position each round. Keep the sensor firmly attached.");
+      printCalibrationPrompt();
+    } else {  // Complete
+      door.setCalibration(calibration.result().axis, calibration.result().openAngleDeg);
+      door.zero(ClosureSource::Manual);  // the final closing press asserts "closed": angle = 0
+      calState = CalState::Done;
+      Serial.println("\nCalibration complete!");
+      Serial.println(calibration.result().message);
+      Serial.println("Closed reference: 0 degrees. Angle and open/closed are gyro ESTIMATES and will drift.");
+      Serial.printf("Alarm activates after %lu seconds open.\n", (unsigned long)(cfg::DOOR_OPEN_LIMIT_MS / 1000UL));
+      Serial.println("To reset the closed reference and the alarm: CLOSE the door fully, then press Button 1.");
+    }
     return;
   }
+
   if (calState == CalState::Done) {
-    if (zeroGate.begin(nowMs)) Serial.println("Button pressed: settling before zeroing...");
-  }
-}
-
-void printCaptureOutcome(CalibrationSession::Outcome o, const Vec3& rotation) {
-  switch (o) {
-    case CalibrationSession::Outcome::Saved:
-      Serial.printf("Position saved. Movement: %.1f degrees\n", magnitude(rotation));
-      if (calibration.settleMotionDeg() > 1.5f)
-        Serial.printf("(The door moved %.1f deg while settling; that motion is included.)\n",
-                      calibration.settleMotionDeg());
-      printCalibrationPrompt();
-      break;
-    case CalibrationSession::Outcome::RestartAccepted:
-      Serial.println("Position saved.");
-      printCalibrationPrompt();
-      break;
-    case CalibrationSession::Outcome::RoundFailed:
-    case CalibrationSession::Outcome::Failed:
-      Serial.printf("\nCalibration rejected: %s\n", calibration.result().message);
-      printCalibrationPrompt();
-      break;
-    case CalibrationSession::Outcome::Complete:
-      door.setCalibration(calibration.result().axis, calibration.result().openAngleDeg);
-      door.zero(ClosureSource::Manual);  // the user just asserted "closed"
-      calState = CalState::Done;
-      Serial.printf("\nCalibration complete! %s\n", calibration.result().message);
-      Serial.println("Closed reference: 0 degrees (manual).");
-      Serial.printf("Alarm activates after %lu seconds open.\n", (unsigned long)(cfg::DOOR_OPEN_LIMIT_MS / 1000UL));
-      Serial.println("To remove accumulated drift: CLOSE the door fully, hold still, press Button 1.");
-      break;
-    default:
-      break;
-  }
-}
-
-// Called every loop: finishes any pending button capture.
-void serviceCapture(uint32_t nowMs) {
-  if (calState == CalState::Moves && calibration.capturing()) {
-    Vec3 rotation = door.rotation();
-    CalibrationSession::Outcome o = calibration.service(nowMs, door.settled(), rotation);
-    if (o == CalibrationSession::Outcome::Pending) return;
-    if (o == CalibrationSession::Outcome::SettleTimeout) {
-      // Rotation keeps accumulating: nothing was lost or consumed.
-      Serial.println("Couldn't settle in time (still moving?). Hold the door steady and press Button 1 again.");
-      return;
-    }
-    door.resetRotation();
-    printCaptureOutcome(o, rotation);
-  } else if (calState == CalState::Done && zeroGate.active()) {
-    SettleGate::Result res = zeroGate.service(nowMs, door.settled());
-    if (res == SettleGate::Result::Confirmed) {
-      // This is a USER ASSERTION that the door is closed, not a measurement.
-      float before = door.angle();
-      door.zero(ClosureSource::Manual);
-      Serial.printf("Closed reference set manually (estimate was %.1f deg before zeroing).\n", before);
-    } else if (res == SettleGate::Result::TimedOut) {
-      Serial.println("Couldn't settle in time; angle NOT zeroed. Hold the door steady and press Button 1 again.");
-    }
+    // A USER ASSERTION that the door is physically closed, not a measurement.
+    float before = door.angle();
+    door.zero(ClosureSource::Manual);  // gyro mode: door reads closed, so the alarm stops and its timer resets
+    Serial.printf("Closed reference reset: 0 degrees (estimate was %.1f). Press Button 1 ONLY when the door is physically closed.\n",
+                  before);
+#if USE_REED_SWITCH
+    Serial.println("(Reed switch enabled: the contact, not this button, decides open/closed and the alarm.)");
+#endif
   }
 }
 
@@ -497,8 +405,7 @@ void loop() {
 
   handleSerial();
   if (mpuReady) pollGyro();
-  if (pressEdge) handleButtonPress(now);
-  serviceCapture(millis());
+  if (pressEdge) handleButtonPress();
 
   now = millis();
   updateDoorAndAlarm(now);
