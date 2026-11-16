@@ -31,9 +31,20 @@ constexpr uint32_t SAMPLE_US = 20000;           // gyro poll period: 20 ms = 50 
 // ---- Calibration (simple, button-guided) ---------------------------
 constexpr int BIAS_SAMPLES = 100;               // gyro samples averaged for the offset (~2 s)
 constexpr float BIAS_NOISY_RANGE_DPS = 8.0f;    // dps. Only prints a NOTE if the sensor moved this much; never blocks
-constexpr float CAL_MIN_MOVE_DEG = 10.0f;       // deg. Each open/close movement must be at least this
-constexpr float CAL_MAX_DEVIATION = 0.40f;      // each movement within 40 % of the average size
-constexpr float CAL_MIN_ALIGNMENT = 0.80f;      // cos(angle) between a movement and the hinge axis (about 37 deg; a real hinge turn scores ~0.98)
+constexpr float CAL_MIN_MOVE_DEG = 10.0f;       // each of the four movements must project at least this far
+constexpr float CAL_MAX_DEVIATION = 0.40f;      // reject a movement > 40 % from the average size
+// Reference behaviour while calibrating: if the gyro reads ~0 for STILL_MS, the
+// sensor is not moving: ignore that rotation and slowly re-learn the offset.
+constexpr float STILL_RATE_DPS = 1.5f;
+constexpr float STILL_S = 1.0f;
+constexpr float BIAS_ALPHA = 0.005f;
+
+// ---- TEST SWITCH ----------------------------------------------------
+// true  = bench testing without a fridge/door: temperature snapshots are
+//         uploaded even when the door state is unknown / not calibrated
+//         (door fields are sent as closed, angle 0). Everything else unchanged.
+// false = normal operation.
+constexpr bool TEST_TEMP_ONLY = true;
 
 // ---- Pins ----------------------------------------------------------
 constexpr int I2C_SDA = 21;

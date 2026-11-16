@@ -136,56 +136,51 @@ class BiasAverager {
 // ------------------------ Calibration checks ----------------------
 struct CalibrationResult {
   bool ok;
-  char message[200];
-  Vec3 axis;            // unit hinge axis; positive rotation = opening
-  float openAngleDeg;   // average measured opening angle
-  CalibrationResult() : ok(false), axis(), openAngleDeg(0) { message[0] = 0; }
+  char message[200];   // ok: summary; !ok: the specific failure
+  char warning[200];   // unused (kept empty)
+  Vec3 axis;           // unit hinge axis; positive rotation = opening
+  float openAngleDeg;  // (open1 + open2) / 2
+  CalibrationResult() : ok(false), axis(), openAngleDeg(0) { message[0] = 0; warning[0] = 0; }
 };
 
-// The four button-confirmed movements: open, close, open, close
-// (integrated rotation vectors, degrees, sensor frame).
-// Basic checks only: negligible movement, inconsistent direction, and the
-// original "no movement more than 40 % from the average" check.
+// Reference calibration. moves = rotation vectors for open, close, open, close.
+//   direction = m0 - m1 + m2 - m3;  axis = direction / |direction|
 inline CalibrationResult validateCalibration(const Vec3 moves[4]) {
   CalibrationResult r;
-  // Opening and closing are opposite rotations about the same hinge axis.
+  for (int i = 0; i < 4; i++) {
+    if (!isfinite(moves[i].x) || !isfinite(moves[i].y) || !isfinite(moves[i].z)) {
+      snprintf(r.message, sizeof(r.message), "movement %d contained a non-finite value (sensor data error).", i + 1);
+      return r;
+    }
+  }
   Vec3 direction = (moves[0] - moves[1]) + (moves[2] - moves[3]);
   float length = magnitude(direction);
-  if (length < 1.0f) {
-    snprintf(r.message, sizeof(r.message),
-             "the four movements cancel out or are negligible: open and close must be opposite turns of the door.");
+  if (!isfinite(length) || length < 1.0f) {
+    snprintf(r.message, sizeof(r.message), "essentially no movement, or opening and closing cancel out: no hinge axis.");
     return r;
   }
   Vec3 axis = direction * (1.0f / length);
   const float p[4] = {dot(moves[0], axis), -dot(moves[1], axis), dot(moves[2], axis), -dot(moves[3], axis)};
   for (int i = 0; i < 4; i++) {
-    float mag = magnitude(moves[i]);
-    const char* what = (i % 2 == 0) ? "opening" : "closing";
-    if (mag < cfg::CAL_MIN_MOVE_DEG) {
+    if (p[i] < cfg::CAL_MIN_MOVE_DEG) {
       snprintf(r.message, sizeof(r.message),
-               "the %s movement %d was only %.0f deg (need at least %.0f): the door barely moved.", what, i + 1, mag,
-               cfg::CAL_MIN_MOVE_DEG);
-      return r;
-    }
-    if (p[i] < cfg::CAL_MIN_MOVE_DEG || p[i] / mag < cfg::CAL_MIN_ALIGNMENT) {
-      snprintf(r.message, sizeof(r.message),
-               "the %s movement %d turned the wrong way or about a different axis than the others.", what, i + 1);
+               "the %s movement %d was only %.1f deg along the hinge axis (need %.0f): too small or the wrong direction.",
+               (i % 2 == 0) ? "opening" : "closing", i + 1, p[i], cfg::CAL_MIN_MOVE_DEG);
       return r;
     }
   }
   float average = 0.25f * (p[0] + p[1] + p[2] + p[3]);
   for (int i = 0; i < 4; i++) {
     if (fabsf(p[i] - average) > average * cfg::CAL_MAX_DEVIATION) {
-      snprintf(r.message, sizeof(r.message),
-               "movement sizes differ too much (%.0f, %.0f, %.0f, %.0f deg). Use the same open position each time.",
+      snprintf(r.message, sizeof(r.message), "movements were inconsistent (%.0f, %.0f, %.0f, %.0f deg; >40%% from the average).",
                p[0], p[1], p[2], p[3]);
       return r;
     }
   }
   r.ok = true;
   r.axis = axis;
-  r.openAngleDeg = average;
-  snprintf(r.message, sizeof(r.message), "Normal open angle: %.1f degrees.", average);
+  r.openAngleDeg = 0.5f * (p[0] + p[2]);
+  snprintf(r.message, sizeof(r.message), "Normal open angle: %.1f degrees.", r.openAngleDeg);
   return r;
 }
 
@@ -253,6 +248,7 @@ class DoorEstimator {
   }
   void setBias(const Vec3& b) {
     bias_ = calBias_ = b;
+    stillS_ = 0;
     hasFilt_ = false;
     resetBlock();
   }
@@ -280,7 +276,20 @@ class DoorEstimator {
     hasFilt_ = true;
 
     if (!calibrated_) {
-      rotation_ = rotation_ + filt_ * dt;
+      // Reference calibration: plain integration, except when the gyro has
+      // read ~0 for STILL_S: then ignore it and slowly re-learn the offset.
+      Vec3 g = corrected;
+      if (magnitude(g) < cfg::STILL_RATE_DPS) {
+        stillS_ += dt;
+        if (stillS_ >= cfg::STILL_S) {
+          bias_ = bias_ + (raw - bias_) * cfg::BIAS_ALPHA;
+          g = Vec3();
+        }
+      } else {
+        stillS_ = 0;
+      }
+      rotation_ = rotation_ + g * dt;
+      return r;
     } else {
       angle_ += dot(filt_, axis_) * dt;
     }
@@ -406,7 +415,7 @@ class DoorEstimator {
 
   Vec3 bias_, calBias_, filt_, rotation_, axis_;
   bool hasFilt_, calibrated_, estClosed_;
-  float angle_, openAngle_, sinceRef_, lastZeroCorrection_ = 0;
+  float angle_, openAngle_, sinceRef_, lastZeroCorrection_ = 0, stillS_ = 0;
   ClosureSource closure_;
   AngleQuality quality_;
   uint32_t missed_, biasAdjustments_, clamped_;

@@ -34,7 +34,8 @@ The simple, button-guided process. There are no stability gates, settling delays
 2. **OPEN** the door to your normal open position. *Hold it still, then press Button 1.* The movement is saved the instant the (debounced) press is seen.
 3. **CLOSE** the door completely. *Hold it still, then press Button 1.* Saved immediately.
 4. Repeat 2-3 once more: four presses in total.
-5. The four movement vectors give the hinge axis and opening direction. Basic checks only (`config.h`): each movement at least 10° (`CAL_MIN_MOVE_DEG`); each turns the right way about roughly the same axis (`CAL_MIN_ALIGNMENT`); no movement more than 40 % from the average size (`CAL_MAX_DEVIATION`). If a check fails you are told which one and the four presses start again.
+5. Exactly the reference check: `direction = m0 - m1 + m2 - m3`, `axis = direction/|direction|`. Rejected (specific reason printed, four presses restart) if: a non-finite value, `|direction| < 1`, any movement projects under 10° (`CAL_MIN_MOVE_DEG`), or any is more than 40 % from the average (`CAL_MAX_DEVIATION`). Normal open angle = (open1 + open2) / 2.
+   While calibrating, the reference's stillness rule applies: if the gyro reads under 1.5 dps for 1 s, that rotation is ignored and the offset is slowly re-learned. The gyro runs at ±1000 dps (register 0x1B = 0x10, divisor 32.8).
 6. After the final closing press the angle is set to **0°** and monitoring starts.
 
 Angle integration is continuous (also during the calibration movements). Failed MPU reads are skipped and never counted as samples.
@@ -42,7 +43,7 @@ Angle integration is continuous (also during the calibration movements). Failed 
 **Button 1 after calibration** sets the closed reference to 0° and (in gyro mode) resets the alarm and its timer. **Press it only when the door is physically closed.** It is your assertion, not a measurement. With the reed switch enabled the contact, not the button, decides open/closed and the alarm.
 Send `c` over Serial any time to recalibrate without reflashing.
 
-> History: a stricter calibration (rolling stability windows, trimmed mean, settle delays, tighter open/close consistency) was tried and removed because it was too hard to complete by hand. This simple process accepts what the stricter one rejected, e.g. open/close of 64.7° / 47.1° / 84.4° / 71.9° passes. That is more convenient, **not more accurate**.
+> History: a stricter calibration (rolling stability windows, trimmed mean, settle delays, tighter open/close consistency) was tried and removed because it was too hard to complete by hand. This simple process accepts what the stricter one rejected, e.g. open/close of 64.7° / 47.1° / 84.4° / 71.9° passes. That is more convenient, **not more accurate**. The calibration is now the original reference version again.
 
 ### What this does NOT fix: gyro drift
 This restores an easier workflow; it does not reduce drift. Averaging 100 samples only gives an approximate offset (a bump or tremor adds error), and any residual offset is integrated into the angle. The angle and the gyro-based open/closed state are **estimates**; expect them to wander, and a closed door may read open (alarm stuck on) until you press Button 1 on a closed door.
@@ -119,6 +120,9 @@ Temperature honesty: the BMP280 measures **where it is mounted**. On the outside
 | **Any behavior on real hardware** (sensor noise, real drift, buzzer, button, reed, Wi-Fi loss) | ⬜ **not tested** |
 
 Threshold values in `config.h` are engineering estimates from simulation, not tuned on your sensor.
+
+### Bench test switch
+`cfg::TEST_TEMP_ONLY` in `include/config.h` (default `false`). Set to `true` to upload temperature snapshots without a fridge/door/calibration: the door-unknown gating is bypassed and door fields are sent as closed/angle 0. Set back to `false` for real use.
 
 ## Hardware test checklist
 Record serial output for each. ☐ = pass/fail.

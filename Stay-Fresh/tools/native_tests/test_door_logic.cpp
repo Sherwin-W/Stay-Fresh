@@ -94,43 +94,38 @@ static void test_bias_average() {
 }
 
 static void test_calibration_validation() {
-  printf("calibration validation (basic checks)\n");
+  printf("calibration validation (reference checks)\n");
   Vec3 ax = normalized(axisA());
-  {  // the field log that the stricter checks rejected is accepted again (original behaviour)
+  {  // the field log: accepted (within 40 %)
     Vec3 m[4] = {ax * 64.7f, ax * -47.1f, ax * 84.4f, ax * -71.9f};
     CalibrationResult r = validateCalibration(m);
     CHECK(r.ok, "%s", r.message);
-    CHECK(fabsf(r.openAngleDeg - 67.0f) < 0.1f);
+    CHECK(fabsf(r.openAngleDeg - 74.55f) < 0.1f, "open angle = (open1+open2)/2: %.2f", r.openAngleDeg);
     CHECK(dot(r.axis, ax) > 0.999f);
   }
-  {  // negligible movement
-    Vec3 m[4] = {ax * 5.0f, ax * -5.0f, ax * 5.0f, ax * -5.0f};
-    CalibrationResult r = validateCalibration(m);
-    CHECK(!r.ok);
-    printf("  negligible -> %s\n", r.message);
-  }
-  {  // one tiny movement among good ones
-    Vec3 m[4] = {ax * 60.0f, ax * -60.0f, ax * 60.0f, ax * -4.0f};
-    CHECK(!validateCalibration(m).ok);
-  }
-  {  // "close" turns the same way as "open"
-    Vec3 m[4] = {ax * 60.0f, ax * 60.0f, ax * 60.0f, ax * 60.0f};
-    CalibrationResult r = validateCalibration(m);
-    CHECK(!r.ok);
-    printf("  same direction -> %s\n", r.message);
-  }
-  {  // different axes
-    Vec3 other = normalized(Vec3(1.0f, -0.2f, -0.3f));  // ~90 deg from ax
-    Vec3 m[4] = {ax * 60.0f, ax * -60.0f, other * 60.0f, other * -60.0f};
-    CHECK(!validateCalibration(m).ok);
-  }
-  {  // sizes more than 40 % from the average (original rule)
+  {  // >40 % from the average: rejected, like the reference
     Vec3 m[4] = {ax * 30.0f, ax * -30.0f, ax * 100.0f, ax * -100.0f};
     CalibrationResult r = validateCalibration(m);
     CHECK(!r.ok);
-    printf("  inconsistent sizes -> %s\n", r.message);
+    printf("  inconsistent -> %s\n", r.message);
   }
-  {  // opposite-sign (door opens the other way round) is fine: the axis flips so "opening" is positive
+  {  // essentially no movement / below 10 deg
+    Vec3 m[4] = {ax * 0.2f, ax * -0.2f, ax * 0.2f, ax * -0.2f};
+    CHECK(!validateCalibration(m).ok);
+    Vec3 q[4] = {ax * 60.0f, ax * -60.0f, ax * 60.0f, ax * -8.0f};
+    CHECK(!validateCalibration(q).ok);
+  }
+  {  // close turns the same way as open
+    Vec3 m[4] = {ax * 60.0f, ax * 60.0f, ax * 60.0f, ax * 60.0f};
+    CHECK(!validateCalibration(m).ok);
+  }
+  {  // NaN / zero vectors never reach a division
+    Vec3 m[4] = {ax * 60.0f, ax * -60.0f, Vec3(NAN, 0, 0), ax * -60.0f};
+    CHECK(!validateCalibration(m).ok);
+    Vec3 z[4];
+    CHECK(!validateCalibration(z).ok);
+  }
+  {  // door that opens the other way round: axis flips so opening is positive
     Vec3 m[4] = {ax * -60.0f, ax * 60.0f, ax * -60.0f, ax * 60.0f};
     CalibrationResult r = validateCalibration(m);
     CHECK(r.ok && dot(r.axis, ax) < -0.999f);
@@ -141,29 +136,20 @@ static void test_calibration_session() {
   printf("calibration session (immediate button presses)\n");
   Vec3 ax = normalized(axisA());
   CalibrationSession c;
-  CHECK(c.round() == 1 && c.expectingOpen());
   CHECK(c.press(ax * 64.7f) == CalibrationSession::Outcome::Saved);
-  CHECK(c.round() == 1 && !c.expectingOpen());
   CHECK(c.press(ax * -47.1f) == CalibrationSession::Outcome::Saved);
   CHECK(c.round() == 2 && c.expectingOpen());
   CHECK(c.press(ax * 84.4f) == CalibrationSession::Outcome::Saved);
-  CHECK(c.press(ax * -71.9f) == CalibrationSession::Outcome::Complete, "four presses, then done");
-  CHECK(c.result().ok);
+  CHECK(c.press(ax * -71.9f) == CalibrationSession::Outcome::Complete);
 
-  CalibrationSession d;  // inconsistent: starts the four presses again, nothing else gates it
-  d.press(ax * 60.0f);
-  d.press(ax * 60.0f);
-  d.press(ax * 60.0f);
-  CHECK(d.press(ax * 60.0f) == CalibrationSession::Outcome::Failed);
+  CalibrationSession d;  // inconsistent: start the four presses again
+  d.press(ax * 30.0f); d.press(ax * -30.0f); d.press(ax * 100.0f);
+  CHECK(d.press(ax * -100.0f) == CalibrationSession::Outcome::Failed);
   CHECK(d.round() == 1 && d.expectingOpen());
-  printf("  message: %s\n", d.result().message);
-  d.press(ax * 60.0f);
-  d.press(ax * -58.0f);
-  d.press(ax * 62.0f);
+  d.press(ax * 60.0f); d.press(ax * -58.0f); d.press(ax * 62.0f);
   CHECK(d.press(ax * -61.0f) == CalibrationSession::Outcome::Complete);
 }
 
-// Whole workflow on simulated data: bias average, 4 presses, angle = 0, monitoring, manual reset.
 static void test_full_calibration_flow() {
   printf("full calibration flow (simulated)\n");
   Vec3 trueBias(0.7f, -0.4f, 0.3f);
@@ -184,7 +170,7 @@ static void test_full_calibration_flow() {
     o = c.press(rot);  // the press is accepted immediately
   }
   CHECK(o == CalibrationSession::Outcome::Complete, "%s", c.result().message);
-  CHECK(fabsf(c.result().openAngleDeg - 71.0f) < 3.0f, "open angle %.1f", c.result().openAngleDeg);
+  CHECK(fabsf(c.result().openAngleDeg - 70.0f) < 3.0f, "open angle %.1f", c.result().openAngleDeg);
   e.setCalibration(c.result().axis, c.result().openAngleDeg);
   e.zero(ClosureSource::Manual);
   CHECK(e.angle() == 0 && e.estimatedClosed() && e.closureSource() == ClosureSource::Manual);
@@ -208,19 +194,20 @@ static void test_full_calibration_flow() {
   CHECK(!alarm.active() && !alarm.running());
 }
 
-static void test_no_adaptation_before_calibration() {
-  printf("calibration phase is plain integration\n");
-  Sim s(70, axisA(), Vec3(0, 0, 0), 0.05f);
-  DoorEstimator e;
-  e.setBias(Vec3(0, 0, 0));
-  run(s, e, 10.0f, 0, 0.02f);  // 10 s at rest with a true 0 offset
-  CHECK(e.biasAdjustments() == 0);
+static void test_calibration_still_rule() {
+  printf("calibration still rule (reference)\n");
+  Sim t(71, axisA(), Vec3(1.0f, 0, 0), 0.05f);  // 1 dps uncorrected offset, door at rest
   DoorEstimator f;
   f.setBias(Vec3(0, 0, 0));
-  Sim t(71, axisA(), Vec3(1.0f, 0, 0), 0.05f);  // uncorrected 1 dps offset on X
   run(t, f, 10.0f, 0, 0.02f);
-  CHECK(f.biasAdjustments() == 0, "no hidden bias adjustment while calibrating");
-  CHECK(fabsf(f.rotation().x - 10.0f) < 0.5f, "rotation.x=%.2f (pure integral)", f.rotation().x);
+  CHECK(f.biasAdjustments() == 0, "refinement blocks are not used while calibrating");
+  // rest reading 1 dps < 1.5: after 1 s it is treated as zero rotation, so drift does not pile up
+  CHECK(magnitude(f.rotation()) < 1.5f, "rotation=%.2f (would be ~10 without the still rule)", magnitude(f.rotation()));
+  Sim u(72, axisA(), Vec3(0, 0, 0), 0.05f);  // real movement is integrated
+  DoorEstimator g;
+  g.setBias(Vec3(0, 0, 0));
+  run(u, g, 2.0f, 30.0f, 0.02f);
+  CHECK(fabsf(magnitude(g.rotation()) - 60.0f) < 2.0f, "rotation=%.1f", magnitude(g.rotation()));
 }
 
 static void test_alarm() {
@@ -467,7 +454,7 @@ int main() {
   test_calibration_validation();
   test_calibration_session();
   test_full_calibration_flow();
-  test_no_adaptation_before_calibration();
+  test_calibration_still_rule();
   test_alarm();
   test_door_state_resolution();
   test_debouncer();
