@@ -9,59 +9,14 @@
 #include <math.h>
 #include <time.h>
 
+#include "config.h"
+#include "door_logic.h"
+#include "cloud_upload.h"
+#include "oled_ui.h"
+
+using namespace sf;
+
 constexpr uint8_t MPU_ADDR = 0x68;
-constexpr int BUTTON_PIN = 32;
-constexpr int BUZZER_PIN = 27;
-// Drive the buzzer with a PWM tone so passive buzzers/speakers beep
-// instead of just clicking. Also works with active buzzers.
-constexpr int BUZZER_CHANNEL = 0;
-constexpr uint32_t BUZZER_FREQ_HZ = 2000;
-
-constexpr uint32_t SAMPLE_MS = 20;
-constexpr uint32_t PRINT_MS = 500;
-constexpr uint32_t TEMP_MS = 5000;
-constexpr uint32_t DEBOUNCE_MS = 30;
-
-// Sound the buzzer if the door stays open this long.
-constexpr uint32_t OPEN_ALARM_MS = 10UL * 1000UL;
-constexpr uint32_t BEEP_PERIOD_MS = 500; // On/off beep cycle.
-
-// Temperature monitoring: two checks.
-//
-// 1. Direction check: while the door stays closed, average readings into
-//    5-minute buckets and compare the newest bucket to the one 15 minutes
-//    earlier. A rise of more than 0.3 C means the fridge is warming with
-//    the door shut (bad seal, power outage, dying compressor).
-// 2. Warm backstop: alert if the temperature stays above the safe limit
-//    for an hour, even if it's flat (thermostat bumped, fridge dead).
-//
-// How much warmer the door reads than the fridge interior. Measure it by
-// comparing against a fridge thermometer and set it here.
-constexpr float DOOR_OFFSET_C = 0.0f;
-constexpr float SAFE_MAX_C = 4.0f + DOOR_OFFSET_C;
-constexpr float WARM_CLEAR_MARGIN_C = 0.3f; // Must drop this far below to reset.
-constexpr uint32_t WARM_ALARM_MS = 60UL * 60UL * 1000UL; // 1 hour.
-
-constexpr uint32_t TREND_BUCKET_MS = 5UL * 60UL * 1000UL; // 5-minute averages.
-constexpr int TREND_POINTS = 4;          // 4 buckets = 15-minute span.
-constexpr float RISE_THRESHOLD_C = 0.3f; // Above BMP280 jitter.
-constexpr uint32_t TEMP_BEEP_PERIOD_MS = 2000; // Slow beep for temp alarm.
-constexpr uint32_t TEMP_BEEP_ON_MS = 200;
-
-// Estimated closed-position tolerance.
-constexpr float CLOSED_TOLERANCE_DEG = 5.0f;
-
-// Stillness detection: when the gyro reads nearly zero for a while,
-// the door is not moving. Stop integrating and re-learn the gyro offset
-// (it drifts with temperature, especially inside a fridge).
-constexpr float STILL_RATE_DPS = 1.5f;
-constexpr uint32_t STILL_MS = 1000;
-constexpr float BIAS_ALPHA = 0.005f;
-
-struct Vector3
-{
-  float x, y, z;
-};
 
 // ------------------------------------------------------------
 // State
@@ -70,187 +25,136 @@ Adafruit_BMP280 bmp;
 bool bmpReady = false;
 bool mpuReady = false;
 
-Vector3 gyroBias = {0, 0, 0};
-Vector3 biasSum = {0, 0, 0};
-int biasSamples = 0;
-bool biasReady = false;
+BiasAverager biasAverager;
+DoorEstimator door;
+CalibrationSession calibration;
+AlarmTimer alarmTimer(cfg::DOOR_OPEN_LIMIT_MS);
+TempMonitor tempMonitor;
+Debouncer buttonDebounce(cfg::BUTTON_DEBOUNCE_MS);
+Debouncer reedDebounce(cfg::REED_DEBOUNCE_MS);
 
-// Four calibration movements: open, close, open, close.
-Vector3 calibrationMoves[4];
-Vector3 currentRotation = {0, 0, 0};
-int calibrationStage = 0;
-bool calibrated = false;
+CalState calState = CalState::Fault;
+DoorState doorState = DoorState::Unknown;
+bool sensorValid = false;
 
-// Unit vector along the door's rotation axis.
-// Positive rotation means opening.
-Vector3 openingAxis = {0, 0, 0};
+// Gyro sample timing: real timestamps, not an assumed 20 ms.
+uint32_t nextSampleUs = 0;
+uint32_t lastGoodUs = 0;
+uint32_t lastGoodMs = 0;
+bool haveGoodSample = false;
+uint32_t failedReads = 0;
+uint32_t lastReinitMs = 0;
 
-float doorAngle = 0;
-float calibratedOpenAngle = 0;
-bool estimatedClosed = true;
-uint32_t openedAt = 0;
-bool alarmActive = false;
+uint32_t lastPrintMs = 0;
+uint32_t lastTelemetryMs = 0;
+uint32_t telemetrySeq = 0;
 
-// Direction check state.
-float trendHistory[TREND_POINTS];
-int trendCount = 0;
-float bucketSum = 0;
-int bucketReadings = 0;
-uint32_t bucketStart = 0;
-bool tempRising = false;
+bool uploadsPaused = false;        // door state unknown: snapshots are not uploaded yet
+uint32_t lastStatusMs = 0;
+bool snapshotNow = false;          // door/alarm changed: upload right away
+float lastTempC = NAN;
+uint32_t seenOkCount = 0, seenFailCount = 0;
 
-// Warm backstop state.
-bool warmTiming = false;
-uint32_t warmSince = 0;
-bool tempTooWarm = false;
+bool lastButtonPressed = false;
+bool lastReedClosed = false;
 
-bool tempAlarm = false;
-
-bool moving = true;
-uint32_t stillSince = 0;
-
-uint32_t lastSample = 0;
-uint32_t lastPrint = 0;
-uint32_t lastTemperature = 0;
-
-int lastRawButton = HIGH;
-int stableButton = HIGH;
-uint32_t rawChangedAt = 0;
-
-float magnitude(const Vector3 &v)
-{
-  return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+// ------------------------------------------------------------
+// Buzzer (explicit LEDC channel; tone()/noTone() caused
+// "LEDC is not initialized" on Arduino core 2.x)
+// ------------------------------------------------------------
+static bool buzzerIsOn = false;
+void buzzerOn() {
+  if (buzzerIsOn) return;
+  buzzerIsOn = true;
+  ledcWriteTone(cfg::BUZZER_CHANNEL, cfg::BUZZER_FREQ_HZ);
+}
+void buzzerOff() {
+  if (!buzzerIsOn) return;
+  buzzerIsOn = false;
+  ledcWrite(cfg::BUZZER_CHANNEL, 0);
 }
 
-float dot(const Vector3 &a, const Vector3 &b)
-{
-  return a.x * b.x + a.y * b.y + a.z * b.z;
+// Only the door alarm makes sound (fast beeping). Temperature alerts are
+// visual only: the OLED and the dashboard.
+void updateBuzzer(uint32_t nowMs) {
+  bool on = alarmTimer.active() && nowMs % cfg::BEEP_PERIOD_MS < cfg::BEEP_PERIOD_MS / 2;
+  if (on) buzzerOn(); else buzzerOff();
 }
 
-bool writeMpu(uint8_t reg, uint8_t value)
-{
+// ------------------------------------------------------------
+// MPU6050
+// ------------------------------------------------------------
+bool writeMpu(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(reg);
   Wire.write(value);
   return Wire.endTransmission() == 0;
 }
 
-// Read angular velocity in degrees per second.
-// The MPU is configured for +/-1000 degrees/second so a fast
-// door swing does not saturate the sensor.
-bool readGyro(Vector3 &g)
-{
+bool configureMpu() {
+  bool ok = writeMpu(0x6B, 0x00);        // wake
+  ok = ok && writeMpu(0x1A, 0x03);       // low-pass filter (~44 Hz)
+  ok = ok && writeMpu(0x1B, 0x10);       // gyro range +/-1000 deg/s (fast swings do not saturate)
+  return ok;
+}
+
+bool readGyro(Vec3& g) {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x43); // GYRO_XOUT_H
-
-  if (Wire.endTransmission(false) != 0)
-  {
-    return false;
-  }
-
-  if (Wire.requestFrom(MPU_ADDR, (uint8_t)6) != 6)
-  {
-    return false;
-  }
+  Wire.write(0x43);  // GYRO_XOUT_H
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(MPU_ADDR, (uint8_t)6) != 6) return false;
 
   uint8_t raw[6];
-  for (int i = 0; i < 6; i++)
-  {
-    raw[i] = Wire.read();
-  }
+  for (int i = 0; i < 6; i++) raw[i] = Wire.read();
 
   int16_t x = (int16_t)(((uint16_t)raw[0] << 8) | raw[1]);
   int16_t y = (int16_t)(((uint16_t)raw[2] << 8) | raw[3]);
   int16_t z = (int16_t)(((uint16_t)raw[4] << 8) | raw[5]);
 
-  g.x = x / 32.8f;
-  g.y = y / 32.8f;
-  g.z = z / 32.8f;
-
+  // 32.8 LSB per deg/s on the +/-1000 deg/s range (must match register 0x1B).
+  g = Vec3(x / 32.8f, y / 32.8f, z / 32.8f);
   return true;
 }
 
-bool buttonPressed(uint32_t now)
-{
-  int raw = digitalRead(BUTTON_PIN);
-
-  if (raw != lastRawButton)
-  {
-    lastRawButton = raw;
-    rawChangedAt = now;
-  }
-
-  if (now - rawChangedAt >= DEBOUNCE_MS &&
-      raw != stableButton)
-  {
-    stableButton = raw;
-    return stableButton == LOW;
-  }
-
-  return false;
-}
-
-void printPrompt()
-{
-  Serial.printf("\nCalibration round %d of 2\n",
-                calibrationStage / 2 + 1);
-
-  if (calibrationStage % 2 == 0)
-  {
-    Serial.println(
-        "OPEN the door to your normal open position.");
-  }
-  else
-  {
-    Serial.println("CLOSE the door completely.");
-  }
-
+// ------------------------------------------------------------
+// Prompts
+// ------------------------------------------------------------
+void printPrompt() {
+  Serial.printf("\nCalibration round %d of 2\n", calibration.round());
+  Serial.println(calibration.expectingOpen()
+                     ? "OPEN the door to your normal open position."
+                     : "CLOSE the door completely.");
   Serial.println("Hold it still, then press Button 1.");
 }
 
-bool finishCalibration()
-{
-  // Combine opening and reversed closing movements.
-  Vector3 direction = {
-      calibrationMoves[0].x - calibrationMoves[1].x +
-          calibrationMoves[2].x - calibrationMoves[3].x,
+void startBiasMeasurement() {
+  calState = CalState::Bias;
+  biasAverager.reset();
+  door.clearAll();
+  calibration.begin();
+  oledLog("Measuring offset");
+  Serial.println("Keep the door CLOSED and reasonably still.");
+  Serial.printf("Measuring gyro offset from %d samples (about %lu seconds)...\n", cfg::BIAS_SAMPLES,
+                (unsigned long)(cfg::BIAS_SAMPLES * cfg::SAMPLE_US / 1000000UL));
+}
 
-      calibrationMoves[0].y - calibrationMoves[1].y +
-          calibrationMoves[2].y - calibrationMoves[3].y,
+// ------------------------------------------------------------
+// One gyro sample (called every ~20 ms)
+// ------------------------------------------------------------
+void sampleMotion() {
+  uint32_t nowUs = micros();
+  if ((int32_t)(nowUs - nextSampleUs) < 0) return;
+  nextSampleUs += cfg::SAMPLE_US;
+  if ((int32_t)(nowUs - nextSampleUs) > 0) nextSampleUs = nowUs + cfg::SAMPLE_US;  // fell behind: resync
 
-      calibrationMoves[0].z - calibrationMoves[1].z +
-          calibrationMoves[2].z - calibrationMoves[3].z};
-
-  float length = magnitude(direction);
-  if (length < 1.0f)
-    return false;
-
-  openingAxis = {
-      direction.x / length,
-      direction.y / length,
-      direction.z / length};
-
-  float open1 = dot(calibrationMoves[0], openingAxis);
-  float close1 = -dot(calibrationMoves[1], openingAxis);
-  float open2 = dot(calibrationMoves[2], openingAxis);
-  float close2 = -dot(calibrationMoves[3], openingAxis);
-
-  // Require meaningful movement in the expected directions.
-  if (open1 < 10 || close1 < 10 ||
-      open2 < 10 || close2 < 10)
-  {
-    return false;
-  }
-
-  float average = (open1 + close1 + open2 + close2) / 4.0f;
-
-  // Reject very inconsistent calibration movements.
-  float values[] = {open1, close1, open2, close2};
-  for (float value : values)
-  {
-    if (fabsf(value - average) > average * 0.40f)
-    {
-      return false;
+  Vec3 g;
+  if (!readGyro(g)) {  // failed reads are skipped; they never count as samples
+    failedReads++;
+    uint32_t nowMs = millis();
+    // A brown-out can reset the MPU6050 into sleep mode: re-configure it.
+    if (haveGoodSample && nowMs - lastGoodMs > 500 && nowMs - lastReinitMs > 1000) {
+      lastReinitMs = nowMs;
+      configureMpu();
     }
     return;
   }
@@ -279,8 +183,8 @@ bool finishCalibration()
   // calibration movements, which accumulate in door.rotation()).
   DoorEstimator::StepResult r = door.step(g, dt);
   if (r.biasAdapted) {
-    Serial.printf("Gyro offset refined during a still period (adjustment #%lu).\n",
-                  (unsigned long)door.biasAdjustments());
+    // (quiet: refinements happen often; the count is in the DB / status)
+    (void)r;
   }
 }
 
@@ -301,21 +205,22 @@ void finishCalibration() {
   calState = CalState::Done;
   oledLog("Calibration DONE");
   Serial.println("\nCalibration complete!");
-  Serial.printf("Normal open angle: %.1f degrees\n",
-                calibratedOpenAngle);
-  Serial.println("Closed position set to 0 degrees.");
-  Serial.println(
-      "If the angle drifts, CLOSE the door and press Button 1.");
-
-  return true;
+  Serial.println(calibration.result().message);
+  if (calibration.result().warning[0]) Serial.printf("WARNING: %s\n", calibration.result().warning);
+  Serial.println("Closed reference: 0 degrees. Angle and open/closed are gyro ESTIMATES and will drift.");
+  Serial.printf("Alarm activates after %lu seconds open.\n", (unsigned long)(cfg::DOOR_OPEN_LIMIT_MS / 1000UL));
+  Serial.println("To reset the closed reference and the alarm: CLOSE the door fully, then press Button 1.");
 }
 
-void handleCalibrationPress()
-{
-  calibrationMoves[calibrationStage] = currentRotation;
-
-  Serial.printf("Saved movement: %.1f degrees\n",
-                magnitude(currentRotation));
+void handleCalibrationPress() {
+  Vec3 rotation = door.rotation();  // currentRotation
+  door.resetRotation();             // cleared
+  CalibrationSession::Outcome o = calibration.press(rotation);  // stage advances
+  Serial.printf("Saved movement: %.1f degrees\n", magnitude(rotation));
+  { char m[22]; snprintf(m, sizeof(m), "Saved %.0f deg", magnitude(rotation)); oledLog(m); }
+  if (o == CalibrationSession::Outcome::Saved) printPrompt();
+  else finishCalibration();  // Complete or Failed
+}
 
 // Every debounced press is accepted immediately.
 void handleButtonPress() {
@@ -337,10 +242,16 @@ void handleButtonPress() {
   }
 }
 
-  if (calibrationStage < 4)
-  {
-    printPrompt();
-    return;
+// ------------------------------------------------------------
+// Serial commands: 'c' restarts calibration without reflashing.
+// ------------------------------------------------------------
+void handleSerial() {
+  while (Serial.available()) {
+    int c = Serial.read();
+    if ((c == 'c' || c == 'C') && mpuReady) {
+      Serial.println("\nRestarting calibration...");
+      startBiasMeasurement();
+    }
   }
 }
 
@@ -361,88 +272,92 @@ void updateDoorAndAlarm(uint32_t nowMs) {
     }
   }
 
-  if (!calibrated)
-  {
-    Serial.println("\nCalibration movements were inconsistent.");
-    Serial.println(
-        "Keep the sensor firmly attached and start with the door CLOSED.");
-    calibrationStage = 0;
-    printPrompt();
+#if USE_REED_SWITCH
+  bool reedClosed = reedDebounce.update(digitalRead(cfg::REED_PIN) == cfg::REED_ACTIVE_STATE_CLOSED, nowMs);
+  bool reedKnown = reedDebounce.known();
+  if (reedKnown && reedClosed) {
+    // Independently confirmed closure: reset the gyro angle every time.
+    door.zero(ClosureSource::Reed);
+  }
+  if (reedKnown && reedClosed != lastReedClosed) {
+    Serial.println(reedClosed ? "Reed: contact CLOSED (door confirmed closed)."
+                              : "Reed: contact OPEN (door confirmed open).");
+  }
+  lastReedClosed = reedClosed;
+#else
+  const bool reedClosed = false;
+  const bool reedKnown = false;
+#endif
+
+  DoorInputs in;
+  in.reedEnabled = USE_REED_SWITCH;
+  in.reedKnown = reedKnown;
+  in.reedClosed = reedClosed;
+  in.sensorValid = sensorValid;
+  in.calibrated = door.calibrated();
+  in.estimatedClosed = door.estimatedClosed();
+
+  DoorState newState = resolveDoorState(in);
+  if (newState != doorState) {
+    Serial.printf("EVENT: Door %s (%s)\n", toString(newState),
+                  USE_REED_SWITCH ? "reed-confirmed"
+                                  : (newState == DoorState::Closed ? toString(door.closureSource()) : "gyro estimate"));
+    doorState = newState;
+    snapshotNow = true;  // do not wait for the next periodic upload
+    if (newState == DoorState::Open) oledLog("Door OPENED");
+    else if (newState == DoorState::Closed) oledLog("Door CLOSED");
   }
 
-void sampleMotion(float dt)
-{
-  Vector3 g;
-  if (!readGyro(g))
-  {
-    // Do not integrate a missing measurement.
-    return;
+  AlarmTimer::Event ev = alarmTimer.update(nowMs, doorState);
+  if (ev == AlarmTimer::Event::Started) {
+    snapshotNow = true;
+    oledLog("ALARM: door open!");
+    Serial.println("BUZZ!");
+  } else if (ev == AlarmTimer::Event::Stopped) {
+    snapshotNow = true;
+    oledLog("Alarm cleared");
+    Serial.println("Door closed: alarm reset.");
   }
 }
 
-  // Average 100 stationary samples to estimate gyro offset.
-  if (!biasReady)
-  {
-    biasSum.x += g.x;
-    biasSum.y += g.y;
-    biasSum.z += g.z;
-    biasSamples++;
-
-    if (biasSamples >= 100)
-    {
-      gyroBias = {
-          biasSum.x / biasSamples,
-          biasSum.y / biasSamples,
-          biasSum.z / biasSamples};
-
-      biasReady = true;
-      Serial.println("Gyroscope offset calibration complete.");
-      printPrompt();
-    }
-  } else {
-    Serial.println("Temperature unavailable: BMP280 not found.");
-  }
-
-  Vector3 raw = g;
-  g.x -= gyroBias.x;
-  g.y -= gyroBias.y;
-  g.z -= gyroBias.z;
-
-  // Zero-velocity update: if the sensor has been still for a while,
-  // treat the rotation as exactly zero and slowly re-learn the offset.
-  uint32_t now = millis();
-  if (magnitude(g) < STILL_RATE_DPS)
-  {
-    if (moving)
-    {
-      moving = false;
-      stillSince = now;
-    }
-
-    if (now - stillSince >= STILL_MS)
-    {
-      gyroBias.x += BIAS_ALPHA * (raw.x - gyroBias.x);
-      gyroBias.y += BIAS_ALPHA * (raw.y - gyroBias.y);
-      gyroBias.z += BIAS_ALPHA * (raw.z - gyroBias.z);
-      g = {0, 0, 0};
+// ------------------------------------------------------------
+// Temperature + telemetry snapshot (every 5 s)
+// ------------------------------------------------------------
+void takeSnapshot(uint32_t nowMs) {
+  float temperature = NAN;
+  if (bmpReady) {
+    temperature = bmp.readTemperature();
+    lastTempC = temperature;
+    if (isfinite(temperature)) {
+      if (tempMonitor.update(temperature, nowMs, doorState == DoorState::Closed)) {
+        if (!tempMonitor.alarm()) {
+          Serial.printf("Temperature alert cleared (%.2f C)\n", temperature);
+          oledLog("Temp alert cleared");
+        } else if (tempMonitor.rising()) {
+          Serial.printf("ALERT: Temperature rising with door closed (%+.2f C over 15 min, now %.2f C)\n",
+                        tempMonitor.lastChange(), temperature);
+          oledLog("ALERT: temp rising");
+        } else {
+          Serial.printf("ALERT: Above %.1f C for 1+ hour (%.2f C)\n", cfg::SAFE_MAX_C, temperature);
+          oledLog("ALERT: >4C 1 hour");
+        }
+      }
     }
   }
-  else
-  {
-    moving = true;
-  }
 
-  if (!calibrated)
-  {
-    currentRotation.x += g.x * dt;
-    currentRotation.y += g.y * dt;
-    currentRotation.z += g.z * dt;
+  telemetrySeq++;
+
+#if !CLOUD_SEND_EXTENDED
+  // The original table cannot say "unknown": door_open is a boolean. Rather
+  // than upload a misleading "closed", skip door data until we know.
+  // (cfg::TEST_TEMP_ONLY bypasses this so bench temperature tests upload.)
+  if (doorState == DoorState::Unknown && !cfg::TEST_TEMP_ONLY) {
+    uploadsPaused = true;  // shown in the status line; no per-snapshot spam
     return;
   }
 #endif
 
-  if (cfg::TEST_TEMP_ONLY && doorState == DoorState::Unknown)
-    Serial.println("TEST_TEMP_ONLY: uploading temperature with door state unknown.");
+  uploadsPaused = false;
 
   CloudReading reading;
   memset(&reading, 0, sizeof(reading));
@@ -479,33 +394,61 @@ void sampleMotion(float dt)
   queueCloudReading(reading);
 }
 
-  // Project angular velocity onto the learned hinge axis.
-  float rotationRate = dot(g, openingAxis);
-
-  // Integrate continuously, including slow movements and pauses.
-  // Do not reset the angle when movement stops.
-  doorAngle += rotationRate * dt;
-
-  // The door cannot rotate past closed, so a negative angle is only
-  // accumulated error. Clamping re-zeros the door every time it shuts.
-  if (doorAngle < 0)
-  {
-    doorAngle = 0;
+// ------------------------------------------------------------
+// One status line every STATUS_MS: door, alarm, temperature, Wi-Fi, Supabase.
+// Events (door opened, alarm, errors, calibration steps) still print as they happen.
+// ------------------------------------------------------------
+void printStatus(uint32_t nowMs) {
+  char door_[48];
+  if (calState == CalState::Done) {
+    snprintf(door_, sizeof(door_), "Door %s %.0fdeg%s", toString(doorState), door.angle(),
+             alarmTimer.active() ? " ALARM" : "");
+  } else if (calState == CalState::Fault) {
+    snprintf(door_, sizeof(door_), "Door sensor FAULT");
+  } else {
+    snprintf(door_, sizeof(door_), "Calibrating");
   }
 
-  // Use different entry/exit thresholds to avoid flickering
-  // near the boundary.
-  if (estimatedClosed && fabsf(doorAngle) > 7.0f)
-  {
-    estimatedClosed = false;
-    openedAt = millis();
-    Serial.println("EVENT: Door opened (estimated)");
-  }
-  else if (!estimatedClosed &&
-           fabsf(doorAngle) <= CLOSED_TOLERANCE_DEG)
-  {
-    estimatedClosed = true;
-    Serial.println("EVENT: Door closed (estimated)");
+  char temp_[16];
+  if (isfinite(lastTempC)) snprintf(temp_, sizeof(temp_), "%.1fC", lastTempC);
+  else snprintf(temp_, sizeof(temp_), "--");
+
+  char wifi_[24];
+  if (cloudStatus.wifi) snprintf(wifi_, sizeof(wifi_), "OK %ddBm", WiFi.RSSI());
+  else snprintf(wifi_, sizeof(wifi_), "DOWN");
+
+  uint32_t ok = cloudStatus.okCount, fail = cloudStatus.failCount;
+  char cloud_[96];
+  if (!cloudStatus.wifi) snprintf(cloud_, sizeof(cloud_), "waiting for WiFi");
+  else if (!cloudStatus.signedIn) snprintf(cloud_, sizeof(cloud_), "signing in...");
+  else if (uploadsPaused) snprintf(cloud_, sizeof(cloud_), "paused (finish calibration)");
+  else if (ok + fail == 0) snprintf(cloud_, sizeof(cloud_), "connected, nothing sent yet");
+  else if (cloudStatus.lastCode == 201)
+    snprintf(cloud_, sizeof(cloud_), "OK sent=%lu fail=%lu last=%lums %lus ago", (unsigned long)ok, (unsigned long)fail,
+             (unsigned long)cloudStatus.lastTookMs, (unsigned long)((nowMs - cloudStatus.lastOkMs) / 1000));
+  else
+    snprintf(cloud_, sizeof(cloud_), "FAIL code=%d sent=%lu fail=%lu", cloudStatus.lastCode, (unsigned long)ok,
+             (unsigned long)fail);
+
+  Serial.printf("[status] %s | %s | WiFi %s | Supabase %s\n", door_, temp_, wifi_, cloud_);
+}
+
+// ------------------------------------------------------------
+// OLED: simplified version of what the Serial Monitor shows
+// ------------------------------------------------------------
+void updateOled(uint32_t nowMs) {
+  // Upload results -> short log lines (only first success / recovery / failures,
+  // so a healthy 1 Hz upload does not flicker the log).
+  uint32_t ok = cloudStatus.okCount, fail = cloudStatus.failCount;
+  static bool wasFailing = false;
+  if (fail != seenFailCount) {
+    char m[22];
+    snprintf(m, sizeof(m), "Upload FAIL %d", cloudStatus.lastCode);
+    oledLog(m);
+    wasFailing = true;
+  } else if (ok != seenOkCount) {
+    if (seenOkCount == 0 || wasFailing) oledLog("Upload OK");
+    wasFailing = false;
   }
   seenOkCount = ok;
   seenFailCount = fail;
@@ -542,183 +485,48 @@ void sampleMotion(float dt)
   v.uploadOk = cloudStatus.lastCode == 201;
   v.uploadAgeSec = ok > 0 ? (nowMs - cloudStatus.lastOkMs) / 1000 : 0;
   v.uploadCode = cloudStatus.lastCode;
+  v.tempAlert = tempMonitor.alarm() ? (tempMonitor.rising() ? "TEMP RISING" : "TEMP >4C 1HR") : nullptr;
   oledDraw(v);
 }
 
-// Direction check. Only door-closed time goes into the trend, so a
-// door opening never looks like the fridge warming up.
-void updateTrend(float t, uint32_t now)
-{
-  if (!calibrated || !estimatedClosed)
-  {
-    // Door open: start a fresh trend after it closes. Keep the last
-    // verdict so one door opening doesn't silence a real alarm.
-    trendCount = 0;
-    bucketSum = 0;
-    bucketReadings = 0;
-    return;
-  }
-
-  if (bucketReadings == 0)
-  {
-    bucketStart = now;
-  }
-  bucketSum += t;
-  bucketReadings++;
-
-  if (now - bucketStart < TREND_BUCKET_MS)
-    return;
-
-  // Bucket complete: store its average.
-  float average = bucketSum / bucketReadings;
-  bucketSum = 0;
-  bucketReadings = 0;
-
-  if (trendCount == TREND_POINTS)
-  {
-    for (int i = 1; i < TREND_POINTS; i++)
-    {
-      trendHistory[i - 1] = trendHistory[i];
-    }
-    trendCount--;
-  }
-  trendHistory[trendCount++] = average;
-
-  if (trendCount < TREND_POINTS)
-    return;
-
-  float change = trendHistory[TREND_POINTS - 1] - trendHistory[0];
-  tempRising = change > RISE_THRESHOLD_C;
-
-  Serial.printf("Temperature trend: %+.2f C over %lu min%s\n",
-                change,
-                (unsigned long)((TREND_POINTS - 1) * TREND_BUCKET_MS / 60000UL),
-                tempRising ? " (RISING)" : "");
-}
-
-// Warm backstop. Runs regardless of door state: an hour above the limit
-// is far past any normal recovery from a door opening.
-void updateWarmBackstop(float t, uint32_t now)
-{
-  if (t > SAFE_MAX_C)
-  {
-    if (!warmTiming)
-    {
-      warmTiming = true;
-      warmSince = now;
-    }
-    tempTooWarm = now - warmSince >= WARM_ALARM_MS;
-  }
-  else if (t < SAFE_MAX_C - WARM_CLEAR_MARGIN_C)
-  {
-    // Small margin so jitter around the limit doesn't restart the timer.
-    warmTiming = false;
-    tempTooWarm = false;
-  }
-}
-
-void processTemperature(float t, uint32_t now)
-{
-  updateTrend(t, now);
-  updateWarmBackstop(t, now);
-
-  bool shouldAlarm = tempRising || tempTooWarm;
-  if (shouldAlarm != tempAlarm)
-  {
-    tempAlarm = shouldAlarm;
-
-    if (!tempAlarm)
-    {
-      Serial.printf("Temperature alert cleared (%.2f C)\n", t);
-    }
-    else if (tempRising)
-    {
-      Serial.printf("ALERT: Temperature rising with door closed (%.2f C)\n", t);
-    }
-    else
-    {
-      Serial.printf("ALERT: Above %.1f C for 1+ hour (%.2f C)\n",
-                    SAFE_MAX_C, t);
-    }
-  }
-}
-
-void setBuzzer(bool on)
-{
-  static bool buzzerOn = false;
-  if (on == buzzerOn)
-    return;
-
-  buzzerOn = on;
-  ledcWrite(BUZZER_CHANNEL, on ? 128 : 0); // 50% duty = tone, 0 = silent.
-}
-
-void updateBuzzer(uint32_t now)
-{
-  bool shouldAlarm = calibrated && !estimatedClosed &&
-                     now - openedAt >= OPEN_ALARM_MS;
-
-  if (shouldAlarm != alarmActive)
-  {
-    alarmActive = shouldAlarm;
-    Serial.println(alarmActive
-                       ? "ALERT: Door open for 10+ seconds!"
-                       : "Alert cleared.");
-  }
-
-  if (alarmActive)
-  {
-    // Pulse the buzzer on and off.
-    bool on = (now - openedAt) % BEEP_PERIOD_MS < BEEP_PERIOD_MS / 2;
-    setBuzzer(on);
-  }
-  else if (tempAlarm)
-  {
-    // Short chirp every 2 seconds, distinct from the door alarm.
-    bool on = now % TEMP_BEEP_PERIOD_MS < TEMP_BEEP_ON_MS;
-    setBuzzer(on);
-  }
-  else
-  {
-    setBuzzer(false);
-  }
-}
-
-void setup()
-{
+// ------------------------------------------------------------
+// Setup / loop
+// ------------------------------------------------------------
+void setup() {
   Serial.begin(115200);
-  Wire.begin(21, 22);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  ledcSetup(BUZZER_CHANNEL, BUZZER_FREQ_HZ, 8);
-  ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
-  ledcWrite(BUZZER_CHANNEL, 0);
 
-  bmpReady = bmp.begin(0x76);
-  if (!bmpReady)
-  {
-    bmpReady = bmp.begin(0x77);
-  }
+  Wire.begin(cfg::I2C_SDA, cfg::I2C_SCL);
+  Wire.setTimeOut(50);
 
   pinMode(cfg::BUTTON_PIN, INPUT_PULLUP);
   buttonDebounce.begin(false, millis());
 
-  mpuReady = writeMpu(0x6B, 0x00); // Wake MPU.
-  if (mpuReady)
-  {
-    mpuReady = writeMpu(0x1A, 0x03); // Low-pass filter.
-  }
-  if (mpuReady)
-  {
-    mpuReady = writeMpu(0x1B, 0x10); // Gyro +/-1000 dps.
-  }
+  if (!oledBegin()) Serial.println(USE_OLED ? "OLED not found (check wiring / address)." : "OLED disabled.");
 
-  if (mpuReady)
-  {
-    Serial.println("\nKeep the door CLOSED and STILL.");
-    Serial.println("Measuring gyro offset for about 2 seconds...");
-  }
-  else
-  {
+#if USE_REED_SWITCH
+  pinMode(cfg::REED_PIN, INPUT_PULLUP);
+  reedDebounce.begin(digitalRead(cfg::REED_PIN) == cfg::REED_ACTIVE_STATE_CLOSED, millis());
+#endif
+
+  ledcSetup(cfg::BUZZER_CHANNEL, 1000, 8);
+  ledcAttachPin(cfg::BUZZER_PIN, cfg::BUZZER_CHANNEL);
+  buzzerOff();
+
+  Serial.printf("\nStay-Fresh: fridge monitor v%s\n", STAYFRESH_FW_VERSION);
+  Serial.printf("Mode: %s\n", USE_REED_SWITCH ? "reed switch decides open/closed; gyro = approximate angle"
+                                              : "gyro-only (estimated closure; will drift)");
+
+  bmpReady = bmp.begin(0x76);
+  if (!bmpReady) bmpReady = bmp.begin(0x77);
+  Serial.println(bmpReady ? "BMP280 ready." : "BMP280 not found.");
+
+  mpuReady = configureMpu();
+  if (mpuReady) {
+    Serial.println("MPU6050 responding.");
+    startBiasMeasurement();
+  } else {
+    calState = CalState::Fault;
+    oledLog("MPU6050 not found");
     Serial.println("MPU6050 not found. Check wiring.");
 #if !USE_REED_SWITCH
     Serial.println("Without the MPU6050 (and no reed switch) the door state stays UNKNOWN.");
@@ -733,66 +541,35 @@ void setup()
   startCloudUpload();
 }
 
-void loop()
-{
+void loop() {
   uint32_t now = millis();
 
-  if (mpuReady && now - lastSample >= SAMPLE_MS)
-  {
-    float dt = (now - lastSample) / 1000.0f;
-    lastSample = now;
-    sampleMotion(dt);
+  bool pressed = buttonDebounce.update(digitalRead(cfg::BUTTON_PIN) == LOW, now);
+  bool pressEdge = pressed && !lastButtonPressed;
+  lastButtonPressed = pressed;
+
+  handleSerial();
+  if (mpuReady) sampleMotion();
+  if (pressEdge) handleButtonPress();
+
+  now = millis();
+  updateDoorAndAlarm(now);
+
+  if (now - lastStatusMs >= cfg::STATUS_MS) {
+    lastStatusMs = now;
+    printStatus(now);
   }
 
-  if (pressed && mpuReady && biasReady)
-  {
-    if (!calibrated)
-    {
-      handleCalibrationPress();
-    }
-    else
-    {
-      // Only press this when the door is physically CLOSED.
-      doorAngle = 0;
-      estimatedClosed = true;
-      Serial.println("Closed reference reset: 0 degrees.");
-    }
+  // Upload on every door/alarm change, every second while the door is open,
+  // and every TEMP_MS otherwise.
+  uint32_t period = (doorState == DoorState::Open || alarmTimer.active()) ? cfg::TEMP_OPEN_MS : cfg::TEMP_MS;
+  if (snapshotNow || now - lastTelemetryMs >= period) {
+    snapshotNow = false;
+    lastTelemetryMs = now;
+    takeSnapshot(now);
   }
 
   updateBuzzer(now);
-
-  if (calibrated && now - lastPrint >= PRINT_MS)
-  {
-    lastPrint = now;
-
-    Serial.printf(
-        "Door angle: %.1f deg | %s\n",
-        doorAngle,
-        estimatedClosed ? "CLOSED (estimated)" : "OPEN");
-  }
-
-  // Temperature measurement stays at one reading every 5 seconds.
-  if (now - lastTemperature >= TEMP_MS)
-  {
-    lastTemperature = now;
-
-    if (bmpReady)
-    {
-      float temperature = bmp.readTemperature();
-
-      if (isfinite(temperature))
-      {
-        Serial.printf("Temperature: %.2f C\n", temperature);
-        processTemperature(temperature, now);
-      }
-      else
-      {
-        Serial.println("Temperature read failed.");
-      }
-    }
-    else
-    {
-      Serial.println("Temperature unavailable: BMP280 not found.");
-    }
-  }
+  updateOled(now);
+  delay(1);  // let the Wi-Fi/TLS tasks and the idle task run; the 20 ms gyro pacing is unaffected
 }

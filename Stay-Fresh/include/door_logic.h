@@ -482,6 +482,81 @@ class AlarmTimer {
   uint32_t openedAt_;
 };
 
+// ------------------------- Temperature monitor ---------------------
+// Two checks (see config.h): a rise over 15 min while the door stays closed,
+// and an hour continuously above the safe limit. Door-open time never feeds
+// the trend, so opening the door never looks like the fridge warming up.
+class TempMonitor {
+ public:
+  TempMonitor() { reset(); }
+  void reset() {
+    count_ = 0; bucketSum_ = 0; bucketReadings_ = 0; bucketStart_ = 0;
+    rising_ = false; warmTiming_ = false; warmSince_ = 0; tooWarm_ = false; alarm_ = false;
+    change_ = 0;
+    for (int i = 0; i < cfg::TREND_POINTS; i++) history_[i] = 0;
+  }
+  // Returns true when the combined alert state changed (raised or cleared).
+  bool update(float t, uint32_t nowMs, bool doorClosed) {
+    updateTrend(t, nowMs, doorClosed);
+    updateWarm(t, nowMs);
+    bool should = rising_ || tooWarm_;
+    if (should == alarm_) return false;
+    alarm_ = should;
+    return true;
+  }
+  bool alarm() const { return alarm_; }
+  bool rising() const { return rising_; }
+  bool tooWarm() const { return tooWarm_; }
+  float lastChange() const { return change_; }  // newest bucket minus oldest, deg C
+
+ private:
+  void updateTrend(float t, uint32_t now, bool doorClosed) {
+    if (!doorClosed) {
+      // Start a fresh trend after the door closes. Keep the last verdict so
+      // one door opening does not silence a real alert.
+      count_ = 0; bucketSum_ = 0; bucketReadings_ = 0;
+      return;
+    }
+    if (bucketReadings_ == 0) bucketStart_ = now;
+    bucketSum_ += t;
+    bucketReadings_++;
+    if (now - bucketStart_ < cfg::TREND_BUCKET_MS) return;
+
+    float average = bucketSum_ / bucketReadings_;
+    bucketSum_ = 0;
+    bucketReadings_ = 0;
+    if (count_ == cfg::TREND_POINTS) {
+      for (int i = 1; i < cfg::TREND_POINTS; i++) history_[i - 1] = history_[i];
+      count_--;
+    }
+    history_[count_++] = average;
+    if (count_ < cfg::TREND_POINTS) return;
+    change_ = history_[cfg::TREND_POINTS - 1] - history_[0];
+    rising_ = change_ > cfg::RISE_THRESHOLD_C;
+  }
+  // Runs regardless of door state: an hour above the limit is far past any
+  // normal recovery from a door opening.
+  void updateWarm(float t, uint32_t now) {
+    if (t > cfg::SAFE_MAX_C) {
+      if (!warmTiming_) { warmTiming_ = true; warmSince_ = now; }
+      tooWarm_ = now - warmSince_ >= cfg::WARM_ALARM_MS;
+    } else if (t < cfg::SAFE_MAX_C - cfg::WARM_CLEAR_MARGIN_C) {
+      // Small margin so jitter around the limit does not restart the timer.
+      warmTiming_ = false;
+      tooWarm_ = false;
+    }
+  }
+
+  float history_[cfg::TREND_POINTS];
+  int count_;
+  float bucketSum_;
+  int bucketReadings_;
+  uint32_t bucketStart_;
+  bool rising_, warmTiming_, tooWarm_, alarm_;
+  uint32_t warmSince_;
+  float change_;
+};
+
 // ------------------------- Debouncer -------------------------------
 // Accepts a boolean level only after it has been steady for debounceMs.
 class Debouncer {

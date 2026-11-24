@@ -52,6 +52,9 @@ struct CloudStatus {
   volatile uint32_t failCount = 0;
   volatile int lastCode = 0;        // HTTP status of the latest attempt (<= 0: network error)
   volatile uint32_t lastOkMs = 0;   // millis() of the latest success
+  volatile uint32_t lastTookMs = 0; // how long the latest request took
+  volatile bool signedIn = false;   // have a valid access token
+  volatile uint32_t connects = 0;   // new TLS connections opened (a kept-alive connection adds none)
 };
 static CloudStatus cloudStatus;
 
@@ -59,6 +62,9 @@ static CloudStatus cloudStatus;
 // told apart (uptime_ms restarts at zero on every boot).
 static char cloudBootId[9] = "";
 
+// Readings waiting to be uploaded. Door/alarm changes must never be lost, so this
+// holds several; if it is ever full the OLDEST reading is dropped.
+static constexpr int CLOUD_QUEUE_DEPTH = 8;
 static QueueHandle_t cloudQueue = nullptr;
 
 static String cloudAccessToken;
@@ -81,37 +87,64 @@ static int cloudPost(
   static bool clientConfigured = false;
   if (!clientConfigured) {
     client.setCACert(cloudRootCertificates);
-    client.setHandshakeTimeout(12);
+    client.setHandshakeTimeout(30);
     clientConfigured = true;
   }
 
-  HTTPClient http;
-  http.setReuse(true);
-  http.setConnectTimeout(10000);
-  http.setTimeout(10000);
+  // The HTTPClient object must outlive the request: its destructor closes the
+  // socket, which is what made every upload pay a full TLS handshake (~5 s).
+  // Keeping it (and the client) static lets the connection stay open.
+  static HTTPClient http;
+  int code = 0;
+  // A kept-open connection may have been closed by the server while idle. If the
+  // first attempt on a reused connection fails, reconnect and try once more.
+  for (int attempt = 0; attempt < 2; attempt++) {
+    const bool reused = client.connected();
+    const uint32_t startMs = millis();
+    http.setReuse(true);
+    http.setConnectTimeout(30000);
+    http.setTimeout(8000);
 
-  if (!http.begin(client, String(SUPABASE_URL) + path)) {
-    return -1000;
+    if (!http.begin(client, String(SUPABASE_URL) + path)) {
+      return -1000;
+    }
+
+    http.addHeader("apikey", SUPABASE_PUBLISHABLE_KEY);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Connection", "keep-alive");
+
+    if (authenticated) {
+      http.addHeader(
+        "Authorization",
+        String("Bearer ") + cloudAccessToken
+      );
+      http.addHeader("Prefer", "return=minimal");
+    }
+
+    code = http.POST(body);
+
+    if (code < 0 && reused && attempt == 0) {
+      http.end();
+      client.stop();
+      continue;
+    }
+    if (!reused && code > 0) {
+      cloudStatus.connects = cloudStatus.connects + 1;
+      Serial.printf("[net] opened a new TLS connection (request took %lu ms)\n", (unsigned long)(millis() - startMs));
+    }
+    break;
   }
 
-  http.addHeader("apikey", SUPABASE_PUBLISHABLE_KEY);
-  http.addHeader("Content-Type", "application/json");
-
-  if (authenticated) {
-    http.addHeader(
-      "Authorization",
-      String("Bearer ") + cloudAccessToken
-    );
-    http.addHeader("Prefer", "return=minimal");
-  }
-
-  int code = http.POST(body);
-
-  if (code > 0) {
+  // A successful insert ("Prefer: return=minimal") has no body. Calling
+  // getString() on it can block until the 10 s HTTP timeout when the server
+  // does not announce a length, which delayed every upload by ~10 s. Only read
+  // the body when there is something to read (errors, and the sign-in reply).
+  if (code > 0 && !(authenticated && (code == 201 || code == 204))) {
     response = http.getString();
   }
 
   http.end();
+  if (cfg::LOG_EACH_UPLOAD) Serial.printf("[net] connection kept open: %s\n", client.connected() ? "yes" : "NO");
   // A failed request may leave a dead socket: drop it so the next one reconnects.
   if (code < 0 || code >= 400) client.stop();
   return code;
@@ -148,6 +181,7 @@ static bool cloudAuthenticate() {
     }
 
     cloudAccessToken = "";
+    cloudStatus.signedIn = false;
     return false;
   }
 
@@ -169,6 +203,7 @@ static bool cloudAuthenticate() {
 
   cloudAccessToken = access;
   cloudRefreshToken = refresh;
+  cloudStatus.signedIn = true;
   cloudTokenStarted = millis();
 
   // Refresh before expiry. Cap interval to keep millis arithmetic safe.
@@ -188,9 +223,8 @@ static bool cloudAuthenticate() {
   return true;
 }
 
-static void cloudUploadReading(const CloudReading& reading) {
-  StaticJsonDocument<1280> document;
-
+// Fills one JSON object with a reading.
+static void cloudFillJson(JsonObject document, const CloudReading& reading) {
   document["device_id"] = DEVICE_ID;
   document["uptime_ms"] = reading.uptimeMs;
   document["angle_deg"] = reading.angleDeg;
@@ -237,26 +271,39 @@ static void cloudUploadReading(const CloudReading& reading) {
   }
 #endif
 
+}
+
+// Uploads 1..n readings in ONE request (PostgREST accepts a JSON array), so a
+// slow connection never makes readings pile up or get dropped.
+static void cloudUploadReadings(const CloudReading* readings, int count) {
+  DynamicJsonDocument array(count * 1100 + 64);
+  JsonArray rows = array.to<JsonArray>();
+  for (int i = 0; i < count; i++) cloudFillJson(rows.createNestedObject(), readings[i]);
+
   // owner_id and received_at use their database defaults.
   String body;
-  serializeJson(document, body);
+  serializeJson(array, body);
 
   String response;
+  uint32_t startedMs = millis();
   int code = cloudPost(
     "/rest/v1/fridge_readings",
     body,
     true,
     response
   );
+  uint32_t tookMs = millis() - startedMs;
 
   cloudStatus.lastCode = code;
+  cloudStatus.lastTookMs = tookMs;
   if (code == 201) {
     cloudStatus.lastOkMs = millis();
     cloudStatus.okCount = cloudStatus.okCount + 1;
-    Serial.println("Supabase: reading saved.");
+    if (cfg::LOG_EACH_UPLOAD)
+      Serial.printf("Supabase: %d reading%s saved (%lu ms).\n", count, count == 1 ? "" : "s", (unsigned long)tookMs);
   } else {
     cloudStatus.failCount = cloudStatus.failCount + 1;
-    Serial.printf("Supabase upload failed: %d\n", code);
+    Serial.printf("Supabase upload failed: %d (%lu ms)\n", code, (unsigned long)tookMs);
     
     if (code > 0) {
       Serial.print("Database error: ");
@@ -267,6 +314,7 @@ static void cloudUploadReading(const CloudReading& reading) {
     }
 
     if (code == 401) {
+      cloudStatus.signedIn = false;
       cloudAccessToken = "";
     }
 
@@ -308,7 +356,8 @@ static void cloudTask(void*) {
     }
 
     if (time(nullptr) < 1700000000) {
-      Serial.println("Waiting for clock synchronization...");
+      static bool saidWaiting = false;
+      if (!saidWaiting) { saidWaiting = true; Serial.println("Waiting for clock synchronization..."); }
       configTime(0, 0, "pool.ntp.org", "time.google.com");
       vTaskDelay(pdMS_TO_TICKS(5000));
       continue;
@@ -319,19 +368,23 @@ static void cloudTask(void*) {
 
     if (cloudAccessToken.length() == 0 || tokenExpired) {
       if (!cloudAuthenticate()) {
-        vTaskDelay(pdMS_TO_TICKS(30000));
+        vTaskDelay(pdMS_TO_TICKS(5000));  // handshakes fail now and then on weak Wi-Fi: retry soon
         continue;
       }
     }
 
-    CloudReading reading;
+    CloudReading batch[CLOUD_QUEUE_DEPTH];
+    int count = 0;
 
     if (xQueueReceive(
           cloudQueue,
-          &reading,
+          &batch[0],
           pdMS_TO_TICKS(1000)) == pdTRUE) {
+      count = 1;
+      // Anything that queued up while the last request was running goes in the same request.
+      while (count < CLOUD_QUEUE_DEPTH && xQueueReceive(cloudQueue, &batch[count], 0) == pdTRUE) count++;
 
-      cloudUploadReading(reading);
+      cloudUploadReadings(batch, count);
 
       // Limit request frequency, including during failures: a short pause
       // on success, longer after an error so we do not hammer the server.
@@ -343,10 +396,10 @@ static void cloudTask(void*) {
 static void startCloudUpload() {
   snprintf(cloudBootId, sizeof(cloudBootId), "%08x", (unsigned)esp_random());
 
-  // Keep the most recent reading if the network falls behind.
+  // Keep the most recent readings if the network falls behind.
   // This is best-effort telemetry, NOT a durable event log: if the network
-  // is down for a minute, the readings in between are not stored or replayed.
-  cloudQueue = xQueueCreate(1, sizeof(CloudReading));
+  // is down for a while, only the newest few readings are kept.
+  cloudQueue = xQueueCreate(CLOUD_QUEUE_DEPTH, sizeof(CloudReading));
 
   if (cloudQueue == nullptr) {
     Serial.println("Cloud upload: queue allocation failed.");
@@ -371,6 +424,10 @@ static void startCloudUpload() {
 
 static void queueCloudReading(const CloudReading& reading) {
   if (cloudQueue != nullptr) {
-    xQueueOverwrite(cloudQueue, &reading);
+    if (xQueueSend(cloudQueue, &reading, 0) != pdTRUE) {
+      CloudReading dropped;
+      xQueueReceive(cloudQueue, &dropped, 0);  // full: discard the oldest, keep the newest
+      xQueueSend(cloudQueue, &reading, 0);
+    }
   }
 }

@@ -24,8 +24,9 @@
 #define CLOUD_SEND_EXTENDED 0
 #endif
 
-// 1 = an SSD1306 128x64 I2C OLED (address OLED_ADDR, same SDA/SCL as the
-//     sensors) shows status, upload results and the calibration steps.
+// 1 = the SSD1306 128x64 SPI OLED from the IoT kit (wired as in the 244 labs:
+//     CS 5, DC 16, RST 17, SCK 18, MOSI 23) shows status, upload results and
+//     the calibration steps.
 // 0 = no display; firmware behaves as before.
 #ifndef USE_OLED
 #define USE_OLED 1
@@ -33,7 +34,9 @@
 
 namespace cfg {
 
-constexpr uint8_t OLED_ADDR = 0x3C;
+constexpr int OLED_CS = 5;
+constexpr int OLED_DC = 16;
+constexpr int OLED_RST = 17;   // SCK = GPIO18, MOSI = GPIO23 (default VSPI pins)
 constexpr uint32_t OLED_REFRESH_MS = 250;
 constexpr uint32_t OLED_MSG_MS = 4000;          // how long a one-off log line stays on screen
 
@@ -68,7 +71,9 @@ constexpr int BUZZER_CHANNEL = 4;  // explicit LEDC channel (core 2.x API)
 constexpr int REED_PIN = 33;
 
 // ---- Timing --------------------------------------------------------
-constexpr uint32_t PRINT_MS = 500;
+constexpr uint32_t STATUS_MS = 5000;         // one-line status summary on the Serial Monitor
+// true = also print one line per upload (very chatty while the door is open: 1 per second).
+constexpr bool LOG_EACH_UPLOAD = false;
 constexpr uint32_t TEMP_MS = 5000;          // temperature + telemetry period while the door is closed
 constexpr uint32_t TEMP_OPEN_MS = 1000;     // faster uploads while the door is open / alarm on (low latency)
 constexpr uint32_t UPLOAD_GAP_MS = 150;     // pause between uploads (was 1000)
@@ -77,6 +82,27 @@ constexpr uint32_t REED_DEBOUNCE_MS = 50;
 
 // EDIT THIS: how long the door may stay open before the buzzer starts.
 constexpr uint32_t DOOR_OPEN_LIMIT_MS = 20UL * 1000UL;
+
+// ---- Buzzer patterns ------------------------------------------------
+constexpr uint32_t BUZZER_FREQ_HZ = 2000;        // tone, so passive buzzers beep rather than click
+constexpr uint32_t BEEP_PERIOD_MS = 500;         // door alarm: 250 ms on / 250 ms off
+
+// ---- Temperature monitoring (on the device) ------------------------
+// 1. Direction check: while the door stays closed, readings are averaged into
+//    5-minute buckets and the newest bucket is compared with the one 15 minutes
+//    earlier. A rise above RISE_THRESHOLD_C means the fridge is warming with
+//    the door shut (bad seal, power cut, dying compressor).
+// 2. Warm backstop: alert if the temperature stays above the safe limit for an
+//    hour, even if flat.
+// How much warmer the sensor reads than the fridge interior. Measure against a
+// fridge thermometer and set it here.
+constexpr float DOOR_OFFSET_C = 0.0f;
+constexpr float SAFE_MAX_C = 4.0f + DOOR_OFFSET_C;
+constexpr float WARM_CLEAR_MARGIN_C = 0.3f;      // must drop this far below the limit to reset
+constexpr uint32_t WARM_ALARM_MS = 60UL * 60UL * 1000UL;
+constexpr uint32_t TREND_BUCKET_MS = 5UL * 60UL * 1000UL;
+constexpr int TREND_POINTS = 4;                  // 4 buckets = 15-minute span
+constexpr float RISE_THRESHOLD_C = 0.3f;         // above BMP280 jitter
 
 // ---- Door thresholds (hysteresis prevents flicker) -----------------
 constexpr float CLOSED_TOLERANCE_DEG = 5.0f;  // <= this => closed

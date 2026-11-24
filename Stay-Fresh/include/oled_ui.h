@@ -9,11 +9,11 @@
 #include "config.h"
 
 #if USE_OLED
-#include <Wire.h>
+#include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-static Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+static Adafruit_SSD1306 oled(128, 64, &SPI, cfg::OLED_DC, cfg::OLED_RST, cfg::OLED_CS);
 static bool oledReady = false;
 static char oledMsg[22] = "";
 static uint32_t oledMsgMs = 0;
@@ -34,6 +34,7 @@ struct OledView {
   bool uploadOk;
   uint32_t uploadAgeSec;  // seconds since last successful upload
   int uploadCode;         // last HTTP code (<=0 network error)
+  const char* tempAlert;  // nullptr = none; else e.g. "TEMP RISING" (stays until cleared)
 };
 
 // One short log line (max 21 chars), shown for OLED_MSG_MS.
@@ -44,7 +45,8 @@ static void oledLog(const char* msg) {
 }
 
 static bool oledBegin() {
-  oledReady = oled.begin(SSD1306_SWITCHCAPVCC, cfg::OLED_ADDR);
+  SPI.begin();  // default VSPI pins: SCK 18, MOSI 23
+  oledReady = oled.begin(SSD1306_SWITCHCAPVCC);
   if (!oledReady) return false;
   oled.clearDisplay();
   oled.setTextColor(SSD1306_WHITE);
@@ -113,13 +115,24 @@ static void oledDraw(const OledView& v, bool force = false) {
   oled.setTextSize(1);
   oled.setCursor(0, 56);
   if (oledMsg[0] && now - oledMsgMs < cfg::OLED_MSG_MS) oled.print(oledMsg);
-  oled.display();
+  else if (v.tempAlert) oled.print(v.tempAlert);
+
+  // Sending the frame over I2C blocks for ~90 ms and would delay the gyro
+  // sampling, so only do it when the picture actually changed.
+  static uint32_t lastHash = 0;
+  const uint8_t* buf = oled.getBuffer();
+  uint32_t h = 2166136261u;
+  for (int i = 0; i < 128 * 64 / 8; i++) h = (h ^ buf[i]) * 16777619u;
+  if (h != lastHash || force) {
+    lastHash = h;
+    oled.display();
+  }
 }
 #else
 struct OledView {
   bool calibrating; const char* calTitle; const char* calLine1; const char* calLine2;
   float tempC; const char* door; uint32_t openSec; bool alarm; bool wifi;
-  bool uploadKnown; bool uploadOk; uint32_t uploadAgeSec; int uploadCode;
+  bool uploadKnown; bool uploadOk; uint32_t uploadAgeSec; int uploadCode; const char* tempAlert;
 };
 static void oledLog(const char*) {}
 static bool oledBegin() { return false; }

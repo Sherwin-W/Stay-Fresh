@@ -449,6 +449,44 @@ static void test_end_to_end_alarm() {
   CHECK(e.estimatedClosed());
 }
 
+static void test_temp_monitor() {
+  printf("temperature monitor\n");
+  const uint32_t B = cfg::TREND_BUCKET_MS;
+  {  // steady fridge: no alert
+    TempMonitor m;
+    for (uint32_t t = 0; t <= 6 * B; t += 5000) m.update(3.0f, t, true);
+    CHECK(!m.alarm());
+  }
+  {  // warming 0.4 C per bucket with the door closed: rising after 4 buckets
+    TempMonitor m;
+    bool changed = false;
+    for (uint32_t t = 0; t <= 5 * B; t += 5000) {
+      float temp = 3.0f + 0.4f * (float)(t / B);
+      changed = m.update(temp, t, true) || changed;
+    }
+    CHECK(m.rising() && m.alarm() && changed, "rising");
+  }
+  {  // the same warming while the door is open never builds a trend
+    TempMonitor m;
+    for (uint32_t t = 0; t <= 8 * B; t += 5000) m.update(3.0f + 0.4f * (float)(t / B), t, false);
+    CHECK(!m.rising());
+  }
+  {  // an hour above 4 C: alert; a dip below the margin clears it
+    TempMonitor m;
+    for (uint32_t t = 0; t < cfg::WARM_ALARM_MS; t += 5000) m.update(5.0f, t, false);
+    CHECK(!m.tooWarm(), "not yet at 59 min");
+    m.update(5.0f, cfg::WARM_ALARM_MS, false);
+    CHECK(m.tooWarm() && m.alarm());
+    CHECK(m.update(3.0f, cfg::WARM_ALARM_MS + 5000, false) && !m.alarm(), "clears");
+  }
+  {  // jitter just under the limit (inside the margin) does not restart the hour
+    TempMonitor m;
+    for (uint32_t t = 0; t < cfg::WARM_ALARM_MS; t += 5000) m.update((t / 5000) % 2 ? 4.1f : 3.9f, t, false);
+    m.update(4.1f, cfg::WARM_ALARM_MS + 5000, false);  // timer started at the first 4.1 (t = 5 s)
+    CHECK(m.tooWarm());
+  }
+}
+
 int main() {
   test_bias_average();
   test_calibration_validation();
@@ -461,6 +499,7 @@ int main() {
   test_estimator_tracking();
   test_estimator_gaps_and_sources();
   test_end_to_end_alarm();
+  test_temp_monitor();
   printf("\n%d checks, %d failed\n", g_checks, g_fails);
   return g_fails ? 1 : 0;
 }
