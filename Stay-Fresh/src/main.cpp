@@ -1,7 +1,13 @@
+// Stay-Fresh: ESP32 fridge-door monitor.
+//
+// This file is hardware glue only (I2C, button, buzzer, serial, cloud
+// snapshots). All decisions live in include/door_logic.h, which is unit
+// tested on a laptop: see tools/native_tests/run.sh.
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_BMP280.h>
 #include <math.h>
+#include <time.h>
 
 constexpr uint8_t MPU_ADDR = 0x68;
 constexpr int BUTTON_PIN = 32;
@@ -57,6 +63,9 @@ struct Vector3
   float x, y, z;
 };
 
+// ------------------------------------------------------------
+// State
+// ------------------------------------------------------------
 Adafruit_BMP280 bmp;
 bool bmpReady = false;
 bool mpuReady = false;
@@ -243,14 +252,54 @@ bool finishCalibration()
     {
       return false;
     }
+    return;
   }
 
-  calibratedOpenAngle = (open1 + open2) / 2.0f;
+  // Timestamp the sample right after reading it. dt spans any failed
+  // reads, so a stall shows up as a long dt (and is flagged as missed).
+  uint32_t tUs = micros();
+  float dt = haveGoodSample ? (tUs - lastGoodUs) / 1e6f : cfg::NOMINAL_DT_S;
+  lastGoodUs = tUs;
+  lastGoodMs = millis();
+  haveGoodSample = true;
 
-  // The final calibration position is physically closed.
-  doorAngle = 0;
-  estimatedClosed = true;
+  // Step 1: average the gyro offset (no stillness gate, no restarts).
+  if (calState == CalState::Bias) {
+    if (biasAverager.add(g)) {
+      door.setBias(biasAverager.bias());
+      calState = CalState::Moves;
+      Serial.println("Gyroscope offset calibration complete.");
+      oledLog("Offset done");
+      printPrompt();
+    }
+    return;
+  }
 
+  // From here on the angle is integrated continuously (also during the
+  // calibration movements, which accumulate in door.rotation()).
+  DoorEstimator::StepResult r = door.step(g, dt);
+  if (r.biasAdapted) {
+    Serial.printf("Gyro offset refined during a still period (adjustment #%lu).\n",
+                  (unsigned long)door.biasAdjustments());
+  }
+}
+
+// ------------------------------------------------------------
+// Calibration: Button 1 saves currentRotation, clears it, advances.
+// ------------------------------------------------------------
+void finishCalibration() {
+  // Hinge axis = (m0 - m1 + m2 - m3) / |...|, opening angle from the two openings.
+  if (!calibration.result().ok) {
+    oledLog("Calib FAILED: redo");
+    Serial.printf("\nCalibration movements were inconsistent: %s\n", calibration.result().message);
+    Serial.println("Keep the sensor firmly attached and start with the door CLOSED.");
+    printPrompt();
+    return;
+  }
+  door.setCalibration(calibration.result().axis, calibration.result().openAngleDeg);
+  door.zero(ClosureSource::Manual);  // the final closing press asserts "closed": angle = 0
+  calState = CalState::Done;
+  oledLog("Calibration DONE");
   Serial.println("\nCalibration complete!");
   Serial.printf("Normal open angle: %.1f degrees\n",
                 calibratedOpenAngle);
@@ -268,16 +317,49 @@ void handleCalibrationPress()
   Serial.printf("Saved movement: %.1f degrees\n",
                 magnitude(currentRotation));
 
-  currentRotation = {0, 0, 0};
-  calibrationStage++;
+// Every debounced press is accepted immediately.
+void handleButtonPress() {
+  if (!mpuReady) return;
+  if (calState == CalState::Bias) {
+    Serial.println("Still measuring the gyro offset; wait for the prompt.");
+  } else if (calState == CalState::Moves) {
+    handleCalibrationPress();
+  } else if (calState == CalState::Done) {
+    // A USER ASSERTION that the door is physically closed, not a measurement.
+    float before = door.angle();
+    door.zero(ClosureSource::Manual);  // gyro mode: door reads closed, so the alarm stops and its timer resets
+    oledLog("Closed ref reset");
+    Serial.printf("Closed reference reset: 0 degrees (estimate was %.1f). Press Button 1 ONLY when the door is physically closed.\n",
+                  before);
+#if USE_REED_SWITCH
+    Serial.println("(Reed switch enabled: the contact, not this button, decides open/closed and the alarm.)");
+#endif
+  }
+}
 
   if (calibrationStage < 4)
   {
     printPrompt();
     return;
   }
+}
 
-  calibrated = finishCalibration();
+// ------------------------------------------------------------
+// Door state + alarm
+// ------------------------------------------------------------
+void updateDoorAndAlarm(uint32_t nowMs) {
+  // MPU is "valid" only while it keeps returning fresh samples.
+  bool valid = mpuReady && haveGoodSample && (nowMs - lastGoodMs) < cfg::SENSOR_INVALID_AFTER_MS;
+  if (valid != sensorValid) {
+    sensorValid = valid;
+    if (!valid) {
+      door.markSensorLost();
+      oledLog("MPU6050 LOST");
+      Serial.println("WARNING: MPU6050 stopped responding. Door angle is not reliable.");
+    } else {
+      Serial.println("MPU6050 responding again (angle quality stays 'degraded' until re-zeroed).");
+    }
+  }
 
   if (!calibrated)
   {
@@ -287,7 +369,6 @@ void handleCalibrationPress()
     calibrationStage = 0;
     printPrompt();
   }
-}
 
 void sampleMotion(float dt)
 {
@@ -297,6 +378,7 @@ void sampleMotion(float dt)
     // Do not integrate a missing measurement.
     return;
   }
+}
 
   // Average 100 stationary samples to estimate gyro offset.
   if (!biasReady)
@@ -317,8 +399,8 @@ void sampleMotion(float dt)
       Serial.println("Gyroscope offset calibration complete.");
       printPrompt();
     }
-
-    return;
+  } else {
+    Serial.println("Temperature unavailable: BMP280 not found.");
   }
 
   Vector3 raw = g;
@@ -357,6 +439,45 @@ void sampleMotion(float dt)
     currentRotation.z += g.z * dt;
     return;
   }
+#endif
+
+  if (cfg::TEST_TEMP_ONLY && doorState == DoorState::Unknown)
+    Serial.println("TEST_TEMP_ONLY: uploading temperature with door state unknown.");
+
+  CloudReading reading;
+  memset(&reading, 0, sizeof(reading));
+  reading.uptimeMs = nowMs;
+  reading.temperatureC = temperature;
+  reading.angleDeg = door.calibrated() ? door.angle() : 0.0f;
+  reading.doorOpen = (doorState == DoorState::Open);
+  reading.alarmActive = alarmTimer.active();
+  reading.openDurationMs = alarmTimer.openMs(nowMs);
+
+  reading.seq = telemetrySeq;
+  time_t now = time(nullptr);
+  reading.measuredAtUnix = now > 1700000000 ? (int64_t)now : 0;
+  reading.doorState = toString(doorState);
+  reading.closureSource = (doorState == DoorState::Closed) ? toString(
+#if USE_REED_SWITCH
+      ClosureSource::Reed
+#else
+      door.closureSource()
+#endif
+  ) : "none";
+  reading.calibrationState = toString(calState);
+  reading.angleQuality = toString(door.quality());
+  reading.sensorValid = sensorValid;
+  reading.sinceReferenceMs = (uint32_t)(door.secondsSinceReference() * 1000.0f);
+  reading.missedSamples = door.missedSamples();
+  reading.biasAdjustments = door.biasAdjustments();
+  reading.reedEnabled = USE_REED_SWITCH;
+#if USE_REED_SWITCH
+  reading.reedKnown = reedDebounce.known();
+  reading.reedClosed = reedDebounce.value();
+#endif
+
+  queueCloudReading(reading);
+}
 
   // Project angular velocity onto the learned hinge axis.
   float rotationRate = dot(g, openingAxis);
@@ -386,6 +507,42 @@ void sampleMotion(float dt)
     estimatedClosed = true;
     Serial.println("EVENT: Door closed (estimated)");
   }
+  seenOkCount = ok;
+  seenFailCount = fail;
+
+  OledView v;
+  memset(&v, 0, sizeof(v));
+  if (calState == CalState::Bias) {
+    v.calibrating = true;
+    v.calTitle = "CALIBRATION";
+    v.calLine1 = "Hold still";
+    v.calLine2 = "Door CLOSED, wait...";
+  } else if (calState == CalState::Moves) {
+    char title[22];
+    snprintf(title, sizeof(title), "CALIBRATE step %d/4",
+             (calibration.round() - 1) * 2 + (calibration.expectingOpen() ? 1 : 2));
+    static char titleBuf[22];
+    strncpy(titleBuf, title, sizeof(titleBuf));
+    v.calibrating = true;
+    v.calTitle = titleBuf;
+    v.calLine1 = calibration.expectingOpen() ? "OPEN door" : "CLOSE door";
+    v.calLine2 = "hold still, press btn";
+  } else if (calState == CalState::Fault) {
+    v.calibrating = true;
+    v.calTitle = "ERROR";
+    v.calLine1 = "No MPU";
+    v.calLine2 = "check wiring";
+  }
+  v.tempC = lastTempC;
+  v.door = doorState == DoorState::Open ? "OPEN" : doorState == DoorState::Closed ? "CLOSED" : "UNKNOWN";
+  v.openSec = alarmTimer.openMs(nowMs) / 1000;
+  v.alarm = alarmTimer.active();
+  v.wifi = cloudStatus.wifi;
+  v.uploadKnown = (ok + fail) > 0;
+  v.uploadOk = cloudStatus.lastCode == 201;
+  v.uploadAgeSec = ok > 0 ? (nowMs - cloudStatus.lastOkMs) / 1000 : 0;
+  v.uploadCode = cloudStatus.lastCode;
+  oledDraw(v);
 }
 
 // Direction check. Only door-closed time goes into the trend, so a
@@ -542,8 +699,8 @@ void setup()
     bmpReady = bmp.begin(0x77);
   }
 
-  Serial.println(bmpReady ? "BMP280 ready."
-                          : "BMP280 not found.");
+  pinMode(cfg::BUTTON_PIN, INPUT_PULLUP);
+  buttonDebounce.begin(false, millis());
 
   mpuReady = writeMpu(0x6B, 0x00); // Wake MPU.
   if (mpuReady)
@@ -563,17 +720,22 @@ void setup()
   else
   {
     Serial.println("MPU6050 not found. Check wiring.");
+#if !USE_REED_SWITCH
+    Serial.println("Without the MPU6050 (and no reed switch) the door state stays UNKNOWN.");
+#endif
   }
 
-  lastSample = millis();
-  lastPrint = lastSample;
-  lastTemperature = lastSample;
+  nextSampleUs = micros();
+  lastPrintMs = lastTelemetryMs = millis();
+
+  // Networking runs in its own task so it can never block the gyro loop,
+  // and local sensing/alarm keep working if Wi-Fi or Supabase is down.
+  startCloudUpload();
 }
 
 void loop()
 {
   uint32_t now = millis();
-  bool pressed = buttonPressed(now);
 
   if (mpuReady && now - lastSample >= SAMPLE_MS)
   {
