@@ -4,7 +4,8 @@ import { MAX_ROWS, PAGE_SIZE, mergeReadings } from "../lib/derive";
 import { getClient } from "../lib/supabase";
 import type { Reading } from "../lib/types";
 
-export const POLL_MS = 5000;
+/** Poll interval. The firmware uploads every 1 s while the door is open, so 1.5 s keeps the dashboard ~1-2 s behind. */
+export const POLL_MS = 1500;
 
 export interface ReadingsState {
   rows: Reading[]; // ascending by received_at
@@ -16,7 +17,7 @@ export interface ReadingsState {
 
 /**
  * Initial load pages backwards from "now" (so the newest data always arrives
- * first, up to MAX_ROWS). After that, one request every POLL_MS fetches only
+ * first, up to MAX_ROWS). After that, one request every POLL_MS (1.5 s) fetches only
  * rows newer than what we have. Requests never overlap: the next poll is
  * scheduled only after the previous one finished. Cleanup stops the loop.
  */

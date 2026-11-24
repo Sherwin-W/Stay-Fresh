@@ -100,11 +100,11 @@ npm run build                    # typecheck + production build
 ```
 `http://127.0.0.1:5173/?demo=1` (or the "demo" link on the login screen) opens an isolated, clearly bannered **demo mode** with synthetic data; it never queries Supabase.
 
-**Login and RLS:** every row's `owner_id` is the *device's* account and the SELECT policy is `owner_id = auth.uid()`. So the browser must sign in **as that same account** to see anything: type the credentials into the login form; nothing is hardcoded. I verified live that an *unauthenticated* request is rejected (`42501 permission denied`, HTTP 401), so exposing the publishable key doesn't expose data. If other people need access without sharing the device password, see `supabase/proposals/device_sharing.sql` (explicit per-device viewer grants; not applied).
+**No sign-in:** the dashboard uses only the publishable (anon) key and reads without logging in. That requires `supabase/migrations/002_public_read.sql` (read-only anon SELECT limited to `fridge-05`); apply it in the Supabase SQL editor or the dashboard shows a load error. Anyone with the dashboard URL/key can read this device's readings; writes still need the device account (the firmware signs in). `?demo=1` opens the synthetic demo.
 
-Data: bounded queries (newest first, 1000 rows/page, max 6000 rows), then one incremental request every 5 s that never overlaps the previous one and pauses while the tab is hidden. Errors keep the last data and show a banner. Ranges beyond what 6000 rows (~8 h of 5 s data) covers show a "newest N readings only" note; real long-range history would need a server-side downsampling view.
+Data: bounded queries (newest first, 1000 rows/page, max 6000 rows), then one incremental request every 1.5 s that never overlaps the previous one and pauses while the tab is hidden. Errors keep the last data and show a banner. Ranges beyond what 6000 rows (~8 h of 5 s data) covers show a "newest N readings only" note; real long-range history would need a server-side downsampling view.
 
-Display rules: no reading ≠ 0; "unknown" is never shown as "closed"; data older than 60 s is labelled **stale/last known** (and 15–60 s "delayed"); stale telemetry is never attributed to Wi-Fi specifically; open duration is the value at the last report, not extrapolated; history is built from 5 s snapshots and says short events can be missed. The dashboard is read-only: no remote buzzer/reset (that would need a designed, authenticated command channel).
+Display rules: no reading ≠ 0; "unknown" is never shown as "closed"; data older than 60 s is labelled **stale/last known** (and 15–60 s "delayed"); stale telemetry is never attributed to Wi-Fi specifically; open duration is the value at the last report, not extrapolated; history is built from snapshots (every 5 s, every 1 s while the door is open, and immediately on each door/alarm change) and says short events can be missed. The dashboard is read-only: no remote buzzer/reset (that would need a designed, authenticated command channel).
 
 Temperature honesty: the BMP280 measures **where it is mounted**. On the outside of the door it reads the room/door-surface air, *not* the fridge interior. For interior readings, put the sensor (or a probe on a thin cable) inside, away from the door gasket and cooling vent, and keep the ESP32 outside; the gyro still must be rigidly on the door.
 
@@ -148,3 +148,10 @@ Record serial output for each. ☐ = pass/fail.
 * Dashboard history over several hours is capped by row paging; a Postgres view/RPC with time-bucketed aggregates would fix it.
 * Dashboard "age" uses the browser clock vs server `received_at`; a skewed laptop clock skews freshness.
 * Realtime subscriptions were deliberately not used (polling is simpler and robust); if wanted, add the table to the `supabase_realtime` publication and unsubscribe on unmount.
+
+
+## Latency, alerts and OLED (v0.3 changes)
+* **Alarm** now starts after **20 s** open (`DOOR_OPEN_LIMIT_MS`).
+* **Latency:** the device uploads immediately on every door/alarm change, every 1 s while the door is open or the alarm is on (`TEMP_OPEN_MS`), otherwise every 5 s. The TLS connection is kept open between uploads and the pause between uploads is 150 ms. The dashboard polls every 1.5 s.
+* **Temperature alerts (dashboard):** "above 4 °C continuously for 1 h" (a dip to 4 °C or below, or a data gap over 2 min, restarts the hour) and "rising" (fitted trend of at least +1 °C over the last 10 min). Constants are at the bottom of `dashboard/src/lib/derive.ts`. They need the dashboard open; the device does not raise them.
+* **OLED:** SSD1306 128x64 on the same I2C bus (address `cfg::OLED_ADDR` = 0x3C; `USE_OLED 0` disables it). Shows temperature, door/alarm, Wi-Fi, upload result and age, calibration steps, and a one-line event log.

@@ -44,6 +44,17 @@ struct CloudReading {
   bool reedClosed;
 };
 
+// Upload progress, read by the OLED code in the main loop. Written only by
+// the network task (single 32-bit writes, so no lock is needed).
+struct CloudStatus {
+  volatile bool wifi = false;
+  volatile uint32_t okCount = 0;
+  volatile uint32_t failCount = 0;
+  volatile int lastCode = 0;        // HTTP status of the latest attempt (<= 0: network error)
+  volatile uint32_t lastOkMs = 0;   // millis() of the latest success
+};
+static CloudStatus cloudStatus;
+
 // Random per-boot identifier so readings from different power cycles can be
 // told apart (uptime_ms restarts at zero on every boot).
 static char cloudBootId[9] = "";
@@ -64,11 +75,18 @@ static int cloudPost(
     bool authenticated,
     String& response) {
 
-  WiFiClientSecure client;
-  client.setCACert(cloudRootCertificates);
-  client.setHandshakeTimeout(12);
+  // One TLS connection is kept open between uploads: a fresh handshake on
+  // every request cost 1-3 s of latency on the ESP32.
+  static WiFiClientSecure client;
+  static bool clientConfigured = false;
+  if (!clientConfigured) {
+    client.setCACert(cloudRootCertificates);
+    client.setHandshakeTimeout(12);
+    clientConfigured = true;
+  }
 
   HTTPClient http;
+  http.setReuse(true);
   http.setConnectTimeout(10000);
   http.setTimeout(10000);
 
@@ -94,6 +112,8 @@ static int cloudPost(
   }
 
   http.end();
+  // A failed request may leave a dead socket: drop it so the next one reconnects.
+  if (code < 0 || code >= 400) client.stop();
   return code;
 }
 
@@ -229,9 +249,13 @@ static void cloudUploadReading(const CloudReading& reading) {
     response
   );
 
+  cloudStatus.lastCode = code;
   if (code == 201) {
+    cloudStatus.lastOkMs = millis();
+    cloudStatus.okCount = cloudStatus.okCount + 1;
     Serial.println("Supabase: reading saved.");
   } else {
+    cloudStatus.failCount = cloudStatus.failCount + 1;
     Serial.printf("Supabase upload failed: %d\n", code);
     
     if (code > 0) {
@@ -257,6 +281,7 @@ static void cloudTask(void*) {
   WiFi.setAutoReconnect(true);
 
   for (;;) {
+    cloudStatus.wifi = (WiFi.status() == WL_CONNECTED);
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println("WiFi: connecting...");
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -274,6 +299,7 @@ static void cloudTask(void*) {
         continue;
       }
 
+      cloudStatus.wifi = true;
       Serial.print("WiFi connected. IP: ");
       Serial.println(WiFi.localIP());
 
@@ -307,8 +333,9 @@ static void cloudTask(void*) {
 
       cloudUploadReading(reading);
 
-      // Limit request frequency, including during failures.
-      vTaskDelay(pdMS_TO_TICKS(1000));
+      // Limit request frequency, including during failures: a short pause
+      // on success, longer after an error so we do not hammer the server.
+      vTaskDelay(pdMS_TO_TICKS(cloudStatus.lastCode == 201 ? cfg::UPLOAD_GAP_MS : 1000));
     }
   }
 }

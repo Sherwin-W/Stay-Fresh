@@ -1,29 +1,13 @@
 import { render, screen, waitFor } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeRow } from "./lib/derive";
 import type { RawRow } from "./lib/types";
 
 // --- mocks: no network, no real Supabase ---
-const auth = {
-  session: null as null | { user: { email: string } },
-  listeners: [] as Array<(e: string, s: unknown) => void>,
-  signIn: vi.fn(),
-};
 vi.mock("./lib/supabase", () => ({
   isConfigured: true,
   DEVICE_ID: "fridge-05",
-  getClient: () => ({
-    auth: {
-      getSession: () => Promise.resolve({ data: { session: auth.session } }),
-      onAuthStateChange: (cb: (e: string, s: unknown) => void) => {
-        auth.listeners.push(cb);
-        return { data: { subscription: { unsubscribe: vi.fn() } } };
-      },
-      signInWithPassword: (...a: unknown[]) => auth.signIn(...a),
-      signOut: vi.fn(),
-    },
-  }),
+  getClient: () => ({}),
 }));
 const fetchReadings = vi.fn();
 vi.mock("./lib/api", () => ({ fetchReadings: (...a: unknown[]) => fetchReadings(...a) }));
@@ -37,31 +21,20 @@ const row = (o: Partial<RawRow> = {}, ageSec = 3): ReturnType<typeof normalizeRo
   });
 
 beforeEach(() => {
-  auth.session = null;
-  auth.listeners = [];
-  auth.signIn.mockReset();
   fetchReadings.mockReset();
 });
 
-describe("login", () => {
-  it("shows the login form when signed out", async () => {
+describe("no sign-in", () => {
+  it("loads the dashboard straight away without any login form", async () => {
+    fetchReadings.mockResolvedValue([]);
     render(<App />);
-    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
-  });
-  it("shows an error on failed login and does not fetch data", async () => {
-    auth.signIn.mockResolvedValue({ error: { message: "Invalid login credentials" } });
-    render(<App />);
-    await userEvent.type(await screen.findByLabelText("Email"), "a@b.co");
-    await userEvent.type(screen.getByLabelText("Password"), "wrong");
-    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Invalid login credentials");
-    expect(fetchReadings).not.toHaveBeenCalled();
+    await screen.findByTestId("freshness-pill");
+    expect(screen.queryByRole("button", { name: "Sign in" })).not.toBeInTheDocument();
+    expect(fetchReadings).toHaveBeenCalled();
   });
 });
 
-describe("signed-in dashboard", () => {
-  beforeEach(() => { auth.session = { user: { email: "owner@example.com" } }; });
-
+describe("dashboard", () => {
   it("shows an explicit empty state (not zeros)", async () => {
     fetchReadings.mockResolvedValue([]);
     render(<App />);
@@ -120,8 +93,8 @@ describe("signed-in dashboard", () => {
 
 describe("demo mode", () => {
   it("is opt-in, clearly labelled, and never queries the database", async () => {
+    window.history.pushState({}, "", "/?demo=1"); // demo is reached only via ?demo=1
     render(<App />);
-    await userEvent.click(await screen.findByRole("button", { name: /demo data/i }));
     await waitFor(() => expect(screen.getByText("DEMO MODE")).toBeInTheDocument());
     expect(fetchReadings).not.toHaveBeenCalled();
   });

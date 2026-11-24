@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  GAP_BREAK_MS, buildSpans, classifyFreshness, formatAge, formatNumber, mergeReadings, normalizeRow, splitSegments,
+  GAP_BREAK_MS, buildSpans, evaluateTempAlerts, classifyFreshness, formatAge, formatNumber, mergeReadings, normalizeRow, splitSegments,
 } from "./derive";
 import type { RawRow } from "./types";
 
@@ -80,5 +80,58 @@ describe("buildSpans", () => {
   it("marks alarm periods separately", () => {
     const rows = [mk("1", 0, { door_open: true }), mk("2", 5, { door_open: true, alarm_active: true })];
     expect(buildSpans(rows).some((s) => s.alarm)).toBe(true);
+  });
+});
+
+describe("evaluateTempAlerts", () => {
+  const MIN = 60_000;
+  const T0 = Date.parse("2026-01-01T00:00:00Z");
+  const series = (fn: (min: number) => number | null, minutes: number, stepS = 10) => {
+    const rows = [];
+    for (let s = 0; s <= minutes * 60; s += stepS) {
+      const t = T0 + s * 1000;
+      rows.push(normalizeRow(base({ id: String(s), received_at: new Date(t).toISOString(), temperature_c: fn(s / 60) })));
+    }
+    return { rows, now: T0 + minutes * MIN };
+  };
+
+  it("is quiet for a steady, safe temperature", () => {
+    const { rows, now } = series(() => 3.2, 90);
+    expect(evaluateTempAlerts(rows, now)).toEqual({ rising: null, hot: null });
+  });
+  it("flags a steady climb", () => {
+    const { rows, now } = series((m) => 3 + 0.2 * m, 20); // 0.2 °C/min => +2 °C per 10 min
+    const a = evaluateTempAlerts(rows, now);
+    expect(a.rising).not.toBeNull();
+    expect(a.rising!.riseC).toBeGreaterThan(1.9);
+  });
+  it("does not flag a slow drift or a falling temperature", () => {
+    const slow = series((m) => 3 + 0.02 * m, 20);
+    expect(evaluateTempAlerts(slow.rows, slow.now).rising).toBeNull();
+    const fall = series((m) => 6 - 0.2 * m, 20);
+    expect(evaluateTempAlerts(fall.rows, fall.now).rising).toBeNull();
+  });
+  it("needs enough history before judging a trend", () => {
+    const { rows, now } = series((m) => 3 + 0.5 * m, 3);
+    expect(evaluateTempAlerts(rows, now).rising).toBeNull();
+  });
+  it("flags more than an hour above 4 °C, but not 59 minutes", () => {
+    const a = series(() => 5, 61);
+    expect(evaluateTempAlerts(a.rows, a.now).hot).not.toBeNull();
+    const b = series(() => 5, 59);
+    expect(evaluateTempAlerts(b.rows, b.now).hot).toBeNull();
+  });
+  it("restarts the hour when it dipped to 4 °C or below", () => {
+    const { rows, now } = series((m) => (m >= 25 && m < 26 ? 3.9 : 5), 80);
+    expect(evaluateTempAlerts(rows, now).hot).toBeNull(); // only ~54 min since the dip
+  });
+  it("does not bridge a long data gap", () => {
+    const rows = series(() => 5, 90).rows.filter((r) => r.receivedAt < T0 + 20 * MIN || r.receivedAt > T0 + 40 * MIN);
+    expect(evaluateTempAlerts(rows, T0 + 90 * MIN).hot).toBeNull();
+  });
+  it("ignores missing temperatures and stale feeds", () => {
+    const { rows, now } = series((m) => (m % 2 < 1 ? null : 5), 70);
+    expect(evaluateTempAlerts(rows, now).hot).not.toBeNull();
+    expect(evaluateTempAlerts(rows, now + 5 * MIN)).toEqual({ rising: null, hot: null });
   });
 });

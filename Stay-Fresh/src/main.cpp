@@ -12,6 +12,7 @@
 #include "config.h"
 #include "door_logic.h"
 #include "cloud_upload.h"
+#include "oled_ui.h"
 
 using namespace sf;
 
@@ -46,6 +47,10 @@ uint32_t lastReinitMs = 0;
 uint32_t lastPrintMs = 0;
 uint32_t lastTelemetryMs = 0;
 uint32_t telemetrySeq = 0;
+
+bool snapshotNow = false;          // door/alarm changed: upload right away
+float lastTempC = NAN;
+uint32_t seenOkCount = 0, seenFailCount = 0;
 
 bool lastButtonPressed = false;
 bool lastReedClosed = false;
@@ -108,6 +113,7 @@ void startBiasMeasurement() {
   biasAverager.reset();
   door.clearAll();
   calibration.begin();
+  oledLog("Measuring offset");
   Serial.println("Keep the door CLOSED and reasonably still.");
   Serial.printf("Measuring gyro offset from %d samples (about %lu seconds)...\n", cfg::BIAS_SAMPLES,
                 (unsigned long)(cfg::BIAS_SAMPLES * cfg::SAMPLE_US / 1000000UL));
@@ -148,6 +154,7 @@ void sampleMotion() {
       door.setBias(biasAverager.bias());
       calState = CalState::Moves;
       Serial.println("Gyroscope offset calibration complete.");
+      oledLog("Offset done");
       printPrompt();
     }
     return;
@@ -168,6 +175,7 @@ void sampleMotion() {
 void finishCalibration() {
   // Hinge axis = (m0 - m1 + m2 - m3) / |...|, opening angle from the two openings.
   if (!calibration.result().ok) {
+    oledLog("Calib FAILED: redo");
     Serial.printf("\nCalibration movements were inconsistent: %s\n", calibration.result().message);
     Serial.println("Keep the sensor firmly attached and start with the door CLOSED.");
     printPrompt();
@@ -176,6 +184,7 @@ void finishCalibration() {
   door.setCalibration(calibration.result().axis, calibration.result().openAngleDeg);
   door.zero(ClosureSource::Manual);  // the final closing press asserts "closed": angle = 0
   calState = CalState::Done;
+  oledLog("Calibration DONE");
   Serial.println("\nCalibration complete!");
   Serial.println(calibration.result().message);
   if (calibration.result().warning[0]) Serial.printf("WARNING: %s\n", calibration.result().warning);
@@ -189,6 +198,7 @@ void handleCalibrationPress() {
   door.resetRotation();             // cleared
   CalibrationSession::Outcome o = calibration.press(rotation);  // stage advances
   Serial.printf("Saved movement: %.1f degrees\n", magnitude(rotation));
+  { char m[22]; snprintf(m, sizeof(m), "Saved %.0f deg", magnitude(rotation)); oledLog(m); }
   if (o == CalibrationSession::Outcome::Saved) printPrompt();
   else finishCalibration();  // Complete or Failed
 }
@@ -204,6 +214,7 @@ void handleButtonPress() {
     // A USER ASSERTION that the door is physically closed, not a measurement.
     float before = door.angle();
     door.zero(ClosureSource::Manual);  // gyro mode: door reads closed, so the alarm stops and its timer resets
+    oledLog("Closed ref reset");
     Serial.printf("Closed reference reset: 0 degrees (estimate was %.1f). Press Button 1 ONLY when the door is physically closed.\n",
                   before);
 #if USE_REED_SWITCH
@@ -235,6 +246,7 @@ void updateDoorAndAlarm(uint32_t nowMs) {
     sensorValid = valid;
     if (!valid) {
       door.markSensorLost();
+      oledLog("MPU6050 LOST");
       Serial.println("WARNING: MPU6050 stopped responding. Door angle is not reliable.");
     } else {
       Serial.println("MPU6050 responding again (angle quality stays 'degraded' until re-zeroed).");
@@ -272,14 +284,21 @@ void updateDoorAndAlarm(uint32_t nowMs) {
                   USE_REED_SWITCH ? "reed-confirmed"
                                   : (newState == DoorState::Closed ? toString(door.closureSource()) : "gyro estimate"));
     doorState = newState;
+    snapshotNow = true;  // do not wait for the next periodic upload
+    if (newState == DoorState::Open) oledLog("Door OPENED");
+    else if (newState == DoorState::Closed) oledLog("Door CLOSED");
   }
 
   AlarmTimer::Event ev = alarmTimer.update(nowMs, doorState);
   if (ev == AlarmTimer::Event::Started) {
     buzzerOn();
+    snapshotNow = true;
+    oledLog("ALARM: door open!");
     Serial.println("BUZZ!");
   } else if (ev == AlarmTimer::Event::Stopped) {
     buzzerOff();
+    snapshotNow = true;
+    oledLog("Alarm cleared");
     Serial.println("Door closed: alarm reset.");
   }
 }
@@ -291,6 +310,7 @@ void takeSnapshot(uint32_t nowMs) {
   float temperature = NAN;
   if (bmpReady) {
     temperature = bmp.readTemperature();
+    lastTempC = temperature;
     if (isfinite(temperature)) {
       Serial.printf("Temperature: %.2f C (sensor location, not necessarily fridge interior)\n", temperature);
     } else {
@@ -351,6 +371,61 @@ void takeSnapshot(uint32_t nowMs) {
 }
 
 // ------------------------------------------------------------
+// OLED: simplified version of what the Serial Monitor shows
+// ------------------------------------------------------------
+void updateOled(uint32_t nowMs) {
+  // Upload results -> short log lines (only first success / recovery / failures,
+  // so a healthy 1 Hz upload does not flicker the log).
+  uint32_t ok = cloudStatus.okCount, fail = cloudStatus.failCount;
+  static bool wasFailing = false;
+  if (fail != seenFailCount) {
+    char m[22];
+    snprintf(m, sizeof(m), "Upload FAIL %d", cloudStatus.lastCode);
+    oledLog(m);
+    wasFailing = true;
+  } else if (ok != seenOkCount) {
+    if (seenOkCount == 0 || wasFailing) oledLog("Upload OK");
+    wasFailing = false;
+  }
+  seenOkCount = ok;
+  seenFailCount = fail;
+
+  OledView v;
+  memset(&v, 0, sizeof(v));
+  if (calState == CalState::Bias) {
+    v.calibrating = true;
+    v.calTitle = "CALIBRATION";
+    v.calLine1 = "Hold still";
+    v.calLine2 = "Door CLOSED, wait...";
+  } else if (calState == CalState::Moves) {
+    char title[22];
+    snprintf(title, sizeof(title), "CALIBRATE step %d/4",
+             (calibration.round() - 1) * 2 + (calibration.expectingOpen() ? 1 : 2));
+    static char titleBuf[22];
+    strncpy(titleBuf, title, sizeof(titleBuf));
+    v.calibrating = true;
+    v.calTitle = titleBuf;
+    v.calLine1 = calibration.expectingOpen() ? "OPEN door" : "CLOSE door";
+    v.calLine2 = "hold still, press btn";
+  } else if (calState == CalState::Fault) {
+    v.calibrating = true;
+    v.calTitle = "ERROR";
+    v.calLine1 = "No MPU";
+    v.calLine2 = "check wiring";
+  }
+  v.tempC = lastTempC;
+  v.door = doorState == DoorState::Open ? "OPEN" : doorState == DoorState::Closed ? "CLOSED" : "UNKNOWN";
+  v.openSec = alarmTimer.openMs(nowMs) / 1000;
+  v.alarm = alarmTimer.active();
+  v.wifi = cloudStatus.wifi;
+  v.uploadKnown = (ok + fail) > 0;
+  v.uploadOk = cloudStatus.lastCode == 201;
+  v.uploadAgeSec = ok > 0 ? (nowMs - cloudStatus.lastOkMs) / 1000 : 0;
+  v.uploadCode = cloudStatus.lastCode;
+  oledDraw(v);
+}
+
+// ------------------------------------------------------------
 // Setup / loop
 // ------------------------------------------------------------
 void setup() {
@@ -361,6 +436,8 @@ void setup() {
 
   pinMode(cfg::BUTTON_PIN, INPUT_PULLUP);
   buttonDebounce.begin(false, millis());
+
+  if (!oledBegin()) Serial.println(USE_OLED ? "OLED not found (check wiring / address)." : "OLED disabled.");
 
 #if USE_REED_SWITCH
   pinMode(cfg::REED_PIN, INPUT_PULLUP);
@@ -385,6 +462,7 @@ void setup() {
     startBiasMeasurement();
   } else {
     calState = CalState::Fault;
+    oledLog("MPU6050 not found");
     Serial.println("MPU6050 not found. Check wiring.");
 #if !USE_REED_SWITCH
     Serial.println("Without the MPU6050 (and no reed switch) the door state stays UNKNOWN.");
@@ -421,8 +499,14 @@ void loop() {
                   alarmTimer.active() ? "ON" : "OFF");
   }
 
-  if (now - lastTelemetryMs >= cfg::TEMP_MS) {
+  // Upload on every door/alarm change, every second while the door is open,
+  // and every TEMP_MS otherwise.
+  uint32_t period = (doorState == DoorState::Open || alarmTimer.active()) ? cfg::TEMP_OPEN_MS : cfg::TEMP_MS;
+  if (snapshotNow || now - lastTelemetryMs >= period) {
+    snapshotNow = false;
     lastTelemetryMs = now;
     takeSnapshot(now);
   }
+
+  updateOled(now);
 }

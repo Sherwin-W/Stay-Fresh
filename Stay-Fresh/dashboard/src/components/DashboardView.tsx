@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import {
-  RANGES, ageMs, classifyFreshness, describeAngleQuality, describeClosureSource,
+  RANGES, TEMP_SAFE_MAX_C, ageMs, classifyFreshness, evaluateTempAlerts, describeAngleQuality, describeClosureSource,
   formatAge, formatDuration, formatNumber, type Point,
 } from "../lib/derive";
 import type { Reading } from "../lib/types";
@@ -16,17 +16,18 @@ interface Props {
   rangeKey: string;
   onRange: (key: string) => void;
   demo: boolean;
-  userEmail?: string;
-  onSignOut?: () => void;
   onExitDemo?: () => void;
 }
 
 const DOOR_LABEL = { closed: "Closed", open: "Open", unknown: "Unknown" } as const;
 
-export function DashboardView({ deviceId, state, rangeKey, onRange, demo, userEmail, onSignOut, onExitDemo }: Props) {
+export function DashboardView({ deviceId, state, rangeKey, onRange, demo, onExitDemo }: Props) {
   const now = useNow(1000);
   const range = RANGES.find((r) => r.key === rangeKey) ?? RANGES[1];
-  const { rows } = state;
+  // The hook holds at least ALERT_WINDOW_MS; charts/tables only show the selected range.
+  const allRows = state.rows;
+  const rows = useMemo(() => allRows.filter((r) => r.receivedAt >= now - range.ms), [allRows, now, range.ms]);
+  const tempAlerts = useMemo(() => evaluateTempAlerts(allRows, now), [allRows, now]);
   const latest: Reading | undefined = rows[rows.length - 1];
   const age = ageMs(latest, now);
   const fresh = classifyFreshness(age);
@@ -63,10 +64,27 @@ export function DashboardView({ deviceId, state, rangeKey, onRange, demo, userEm
             <i className="dot-ind" aria-hidden="true" />
             {demo ? "Demo" : fresh === "live" ? "Live" : fresh === "delayed" ? "Delayed" : fresh === "stale" ? "Stale" : "No data"}
           </span>
-          {userEmail && <span className="muted small">{userEmail}</span>}
-          {onSignOut && <button className="ghost" onClick={onSignOut}>Sign out</button>}
         </div>
       </header>
+
+      {tempAlerts.hot && (
+        <div className="alarm-banner" role="alert" data-testid="hot-alert">
+          <span aria-hidden="true">🌡</span>
+          <div>
+            <strong>Temperature has been above {TEMP_SAFE_MAX_C} °C for {formatDuration(tempAlerts.hot.durationMs)}.</strong>
+            <div className="small">Now {formatNumber(tempAlerts.hot.currentC)} °C. Food-safety limit is {TEMP_SAFE_MAX_C} °C; check the door and the food. This is the sensor-location temperature, which may differ from the fridge interior.</div>
+          </div>
+        </div>
+      )}
+      {tempAlerts.rising && (
+        <div className="warn-banner" role="alert" data-testid="rising-alert">
+          <span aria-hidden="true">📈</span>
+          <div>
+            <strong>Temperature is rising: +{formatNumber(tempAlerts.rising.riseC)} °C over the last {Math.round(tempAlerts.rising.windowMs / 60_000)} min.</strong>
+            <div className="small">{formatNumber(tempAlerts.rising.fromC)} → {formatNumber(tempAlerts.rising.toC)} °C ({formatNumber(tempAlerts.rising.ratePerMin * 60, 1)} °C/hour trend). Is the door fully closed?</div>
+          </div>
+        </div>
+      )}
 
       {showAlarmLive && (
         <div className="alarm-banner" role="alert">
@@ -93,7 +111,7 @@ export function DashboardView({ deviceId, state, rangeKey, onRange, demo, userEm
       )}
       {state.status === "error" && (
         <div className="error-banner" role="alert" data-testid="fetch-error">
-          Couldn’t load from the database: {state.error}. Showing {rows.length ? "data fetched earlier" : "nothing yet"}; retrying every 5 s
+          Couldn’t load from the database: {state.error}. Showing {rows.length ? "data fetched earlier" : "nothing yet"}; retrying every 1.5 s
           {state.lastOkAt ? ` (last success ${formatAge(now - state.lastOkAt)})` : ""}.
         </div>
       )}
@@ -205,8 +223,8 @@ export function DashboardView({ deviceId, state, rangeKey, onRange, demo, userEm
         <div className="grid">
           <section className="glass panel">
             <h2>Temperature</h2>
-            <p className="muted small">Sensor-location temperature, one point per 5 s snapshot. Breaks mean no data, not zero.</p>
-            <LineChart title="Temperature" unit="°C" points={tempPoints} domain={domain} minSpan={2} empty="No temperature readings in this window." />
+            <p className="muted small">Sensor-location temperature, one point per upload (every 5 s, every 1 s while the door is open). Dashed line = 4 °C safety limit. Breaks mean no data, not zero.</p>
+            <LineChart title="Temperature" unit="°C" points={tempPoints} domain={domain} minSpan={2} refLine={{ v: TEMP_SAFE_MAX_C, label: "limit 4 °C" }} empty="No temperature readings in this window." />
           </section>
           <section className="glass panel">
             <h2>Door angle (estimate)</h2>
@@ -215,7 +233,7 @@ export function DashboardView({ deviceId, state, rangeKey, onRange, demo, userEm
           </section>
           <section className="glass panel span2">
             <h2>Door &amp; alarm history</h2>
-            <p className="muted small">Built from 5-second snapshots uploaded on a best-effort basis: openings shorter than a few seconds, or while the device was offline, can be missed, so this is not an exact event count.</p>
+            <p className="muted small">Built from snapshots uploaded on a best-effort basis (every 5 s, 1 s while open, and on every door change): openings shorter than a few seconds, or while the device was offline, can be missed, so this is not an exact event count.</p>
             <StateTimeline rows={rows} domain={domain} />
           </section>
         </div>

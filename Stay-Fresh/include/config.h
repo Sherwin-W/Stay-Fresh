@@ -24,7 +24,18 @@
 #define CLOUD_SEND_EXTENDED 0
 #endif
 
+// 1 = an SSD1306 128x64 I2C OLED (address OLED_ADDR, same SDA/SCL as the
+//     sensors) shows status, upload results and the calibration steps.
+// 0 = no display; firmware behaves as before.
+#ifndef USE_OLED
+#define USE_OLED 1
+#endif
+
 namespace cfg {
+
+constexpr uint8_t OLED_ADDR = 0x3C;
+constexpr uint32_t OLED_REFRESH_MS = 250;
+constexpr uint32_t OLED_MSG_MS = 4000;          // how long a one-off log line stays on screen
 
 constexpr uint32_t SAMPLE_US = 20000;           // gyro poll period: 20 ms = 50 Hz
 
@@ -44,7 +55,7 @@ constexpr float BIAS_ALPHA = 0.005f;
 //         uploaded even when the door state is unknown / not calibrated
 //         (door fields are sent as closed, angle 0). Everything else unchanged.
 // false = normal operation.
-constexpr bool TEST_TEMP_ONLY = true;
+constexpr bool TEST_TEMP_ONLY = false;
 
 // ---- Pins ----------------------------------------------------------
 constexpr int I2C_SDA = 21;
@@ -58,12 +69,14 @@ constexpr int REED_PIN = 33;
 
 // ---- Timing --------------------------------------------------------
 constexpr uint32_t PRINT_MS = 500;
-constexpr uint32_t TEMP_MS = 5000;          // temperature + telemetry period
+constexpr uint32_t TEMP_MS = 5000;          // temperature + telemetry period while the door is closed
+constexpr uint32_t TEMP_OPEN_MS = 1000;     // faster uploads while the door is open / alarm on (low latency)
+constexpr uint32_t UPLOAD_GAP_MS = 150;     // pause between uploads (was 1000)
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 30;
 constexpr uint32_t REED_DEBOUNCE_MS = 50;
 
 // EDIT THIS: how long the door may stay open before the buzzer starts.
-constexpr uint32_t DOOR_OPEN_LIMIT_MS = 10UL * 1000UL;
+constexpr uint32_t DOOR_OPEN_LIMIT_MS = 20UL * 1000UL;
 
 // ---- Door thresholds (hysteresis prevents flicker) -----------------
 constexpr float CLOSED_TOLERANCE_DEG = 5.0f;  // <= this => closed

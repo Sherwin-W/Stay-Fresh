@@ -1,6 +1,7 @@
 import type { DoorState, Freshness, RawRow, Reading, TimeRange } from "./types";
 
-/** Firmware uploads a snapshot every 5 s (best effort). */
+/** Firmware uploads every 5 s while the door is closed (best effort) and
+ *  every 1 s while it is open or the alarm is on, plus once per door/alarm change. */
 export const EXPECTED_INTERVAL_MS = 5_000;
 /** Up to this age we call the feed "live" (3 intervals + upload latency). */
 export const LIVE_MAX_AGE_MS = 15_000;
@@ -188,4 +189,79 @@ export function describeClosureSource(s: string | null): string {
     case "none": return "Not closed / unknown";
     default: return "Not reported";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Temperature alerts
+// ---------------------------------------------------------------------------
+
+/** Food-safety limit for a refrigerator. */
+export const TEMP_SAFE_MAX_C = 4;
+/** Alert when the temperature has stayed above the limit this long. */
+export const TEMP_SAFE_MAX_MS = 60 * 60_000;
+/** The "above limit" run is broken by a hole in the data longer than this. */
+export const TEMP_RUN_GAP_MS = 2 * 60_000;
+/** Trend window for the "rising" alert. */
+export const RISE_WINDOW_MS = 10 * 60_000;
+/** Alert when the fitted trend climbs at least this much over the window (°C). */
+export const RISE_MIN_C = 1.0;
+/** Need this much of the window actually covered by data before judging a trend. */
+export const RISE_MIN_SPAN_MS = 5 * 60_000;
+export const RISE_MIN_POINTS = 8;
+/** The dashboard must hold at least this much history for the alerts to work. */
+export const ALERT_WINDOW_MS = TEMP_SAFE_MAX_MS + 5 * 60_000;
+
+export interface RisingAlert { riseC: number; ratePerMin: number; windowMs: number; fromC: number; toC: number }
+export interface HotAlert { sinceMs: number; durationMs: number; currentC: number }
+export interface TempAlerts { rising: RisingAlert | null; hot: HotAlert | null }
+
+/**
+ * Evaluates both temperature alerts from the readings held in memory.
+ * Returns no alerts when the newest reading is stale: an old value must not
+ * raise (or clear) a "now" alert. A missing temperature is skipped, never
+ * treated as 0.
+ */
+export function evaluateTempAlerts(rows: Reading[], nowMs: number): TempAlerts {
+  const none: TempAlerts = { rising: null, hot: null };
+  const temps = rows.filter((r) => r.temperatureC !== null);
+  const latest = temps[temps.length - 1];
+  if (!latest || nowMs - latest.receivedAt > STALE_AFTER_MS) return none;
+  const cur = latest.temperatureC as number;
+
+  // 1) Continuously above the safe limit for an hour.
+  let hot: HotAlert | null = null;
+  if (cur > TEMP_SAFE_MAX_C) {
+    let start = latest.receivedAt;
+    for (let i = temps.length - 2; i >= 0; i--) {
+      const r = temps[i];
+      if ((r.temperatureC as number) <= TEMP_SAFE_MAX_C) break;
+      if (start - r.receivedAt > TEMP_RUN_GAP_MS) break;
+      start = r.receivedAt;
+    }
+    const durationMs = latest.receivedAt - start;
+    if (durationMs >= TEMP_SAFE_MAX_MS) hot = { sinceMs: start, durationMs, currentC: cur };
+  }
+
+  // 2) Rising: least-squares slope over the last RISE_WINDOW_MS.
+  let rising: RisingAlert | null = null;
+  const w = temps.filter((r) => r.receivedAt >= latest.receivedAt - RISE_WINDOW_MS);
+  if (w.length >= RISE_MIN_POINTS && w[w.length - 1].receivedAt - w[0].receivedAt >= RISE_MIN_SPAN_MS) {
+    const t0 = w[0].receivedAt;
+    const n = w.length;
+    let sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (const r of w) {
+      const x = (r.receivedAt - t0) / 60_000; // minutes
+      const y = r.temperatureC as number;
+      sx += x; sy += y; sxx += x * x; sxy += x * y;
+    }
+    const denom = n * sxx - sx * sx;
+    if (denom > 0) {
+      const slope = (n * sxy - sx * sy) / denom; // °C per minute
+      const riseC = slope * (RISE_WINDOW_MS / 60_000);
+      if (riseC >= RISE_MIN_C) {
+        rising = { riseC, ratePerMin: slope, windowMs: RISE_WINDOW_MS, fromC: w[0].temperatureC as number, toC: cur };
+      }
+    }
+  }
+  return { rising, hot };
 }

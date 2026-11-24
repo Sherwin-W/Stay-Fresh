@@ -16,3 +16,6 @@ dashboard/coverage
 
 # Host-side test binaries
 tools/native_tests/build
+
+# Vite dev cache
+dashboard/.vite
