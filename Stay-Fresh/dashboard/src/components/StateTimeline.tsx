@@ -8,7 +8,7 @@ interface Props {
   domain: [number, number];
 }
 
-const t = (ms: number) => new Date(ms).toLocaleTimeString();
+const t = (ms: number) => new Date(ms).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
 /** Two lanes: door state and alarm. Gaps are drawn as gaps ("no data"). */
 export function StateTimeline({ rows, domain }: Props) {
@@ -50,7 +50,7 @@ export function StateTimeline({ rows, domain }: Props) {
             </g>
           );
         })}
-        <text className="tick" x={l} y={82}>{new Date(t0).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</text>
+        <text className="tick" x={l} y={82}>{new Date(t0).toLocaleString([], { ...(t1 - t0 > 24 * 3_600_000 ? { weekday: "short" } : {}), hour: "2-digit", minute: "2-digit" })}</text>
         <text className="tick" x={w - r} y={82} textAnchor="end">now</text>
       </svg>
       <ul className="legend" aria-label="Timeline legend">

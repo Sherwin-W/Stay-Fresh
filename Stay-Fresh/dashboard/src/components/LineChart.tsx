@@ -24,8 +24,11 @@ function niceTicks(lo: number, hi: number, n = 4): number[] {
   return out;
 }
 
-const timeFmt = (t: number, withSec: boolean) =>
-  new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", ...(withSec ? { second: "2-digit" } : {}) });
+const timeFmt = (t: number, withSec: boolean, withDay = false) =>
+  new Date(t).toLocaleString([], {
+    ...(withDay ? { weekday: "short" } : {}),
+    hour: "2-digit", minute: "2-digit", ...(withSec ? { second: "2-digit" } : {}),
+  });
 
 /**
  * Single-series SVG line chart. Gaps (missing values, or >30 s without a
@@ -58,6 +61,7 @@ export function LineChart({ title, points, domain, unit, digits = 1, minSpan = 1
   const y = (v: number) => m.t + (1 - (v - lo) / (hi - lo)) * ih;
   const xTicks = Array.from({ length: 5 }, (_, i) => t0 + ((t1 - t0) * i) / 4);
   const withSec = t1 - t0 <= 20 * 60_000;
+  const withDay = t1 - t0 > 24 * 3_600_000; // multi-day ranges: "14:00" alone is ambiguous
 
   const onMove = (e: React.PointerEvent<SVGRectElement>) => {
     if (!valid.length) return;
@@ -68,8 +72,11 @@ export function LineChart({ title, points, domain, unit, digits = 1, minSpan = 1
     setHover(Math.abs(valid[a].t - t) < Math.abs(valid[b].t - t) ? valid[a] : valid[b]);
   };
 
+  // lo/hi above are padded; recompute raw min/max with a loop (spreading ~50k+ values can overflow the stack).
+  let vMin = Infinity, vMax = -Infinity;
+  for (const p of valid) { vMin = Math.min(vMin, p.v); vMax = Math.max(vMax, p.v); }
   const summary = valid.length
-    ? `${title}: ${valid.length} readings, from ${valid[0].v.toFixed(digits)} to ${valid[valid.length - 1].v.toFixed(digits)} ${unit}, range ${Math.min(...valid.map((p) => p.v)).toFixed(digits)} to ${Math.max(...valid.map((p) => p.v)).toFixed(digits)}.`
+    ? `${title}: ${valid.length} readings, from ${valid[0].v.toFixed(digits)} to ${valid[valid.length - 1].v.toFixed(digits)} ${unit}, range ${vMin.toFixed(digits)} to ${vMax.toFixed(digits)}.`
     : `${title}: no data in this window.`;
 
   return (
@@ -87,7 +94,7 @@ export function LineChart({ title, points, domain, unit, digits = 1, minSpan = 1
             ))}
             {xTicks.map((t, i) => (
               <text key={i} className="tick" x={Math.min(Math.max(x(t), m.l + 14), width - m.r - 14)} y={height - 6} textAnchor="middle">
-                {timeFmt(t, withSec)}
+                {timeFmt(t, withSec, withDay)}
               </text>
             ))}
             {refLine && (
@@ -117,7 +124,7 @@ export function LineChart({ title, points, domain, unit, digits = 1, minSpan = 1
             <div className="tooltip" role="status"
               style={{ left: Math.min(Math.max(x(hover.t), 70), width - 70), top: Math.max(y(hover.v!) - 54, 0) }}>
               <strong>{hover.v!.toFixed(digits)} {unit}</strong>
-              <span>{new Date(hover.t).toLocaleTimeString()}</span>
+              <span>{withDay ? new Date(hover.t).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit", second: "2-digit" }) : new Date(hover.t).toLocaleTimeString()}</span>
               <span className="fine">server arrival time</span>
             </div>
           )}

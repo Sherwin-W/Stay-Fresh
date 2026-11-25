@@ -11,14 +11,16 @@ export const STALE_AFTER_MS = 60_000;
 export const GAP_BREAK_MS = 30_000;
 /** Page size PostgREST returns by default (Supabase max-rows). */
 export const PAGE_SIZE = 1000;
-/** Hard cap on rows held in memory. */
-export const MAX_ROWS = 6000;
+/** Hard cap on rows held in memory. Must fit the longest range (72 h): at one upload
+ *  per 5 s that is 51,840 rows, plus extra 1 s uploads while the door is open. */
+export const MAX_ROWS = 120_000;
 
 export const RANGES: TimeRange[] = [
   { key: "15m", label: "15 min", ms: 15 * 60_000 },
   { key: "1h", label: "1 hour", ms: 60 * 60_000 },
   { key: "6h", label: "6 hours", ms: 6 * 3_600_000 },
   { key: "24h", label: "24 hours", ms: 24 * 3_600_000 },
+  { key: "72h", label: "72 hours", ms: 72 * 3_600_000 },
 ];
 
 const num = (v: unknown): number | null => {
